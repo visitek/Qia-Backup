@@ -88,6 +88,8 @@ const state = {
   filesEntries: [],
   filesResolvedRecord: "",
   filesFilter: "",
+  filesIgnoredOnly: false,
+  filesListingIgnored: false,
   filesLoading: false,
   filesRequest: 0,
   filesActionBusy: false,
@@ -836,7 +838,9 @@ function renderBackups() {
       state.filesRecordKey = btn.getAttribute("data-restore");
       state.filesPath = "";
       state.filesFilter = "";
+      state.filesIgnoredOnly = false;
       $("files-filter").value = "";
+      if ($("files-ignored-only")) $("files-ignored-only").checked = false;
       $("files-dest").value = $("files-dest").value || state.restoreDestination;
       showView("files");
       window.setTimeout(() => {
@@ -855,7 +859,9 @@ function renderBackups() {
       state.filesRecordKey = btn.getAttribute("data-files-browse");
       state.filesPath = "";
       state.filesFilter = "";
+      state.filesIgnoredOnly = false;
       $("files-filter").value = "";
+      if ($("files-ignored-only")) $("files-ignored-only").checked = false;
       showView("files");
     });
   });
@@ -1055,6 +1061,21 @@ function renderFiles() {
   if ($("files-refresh")) $("files-refresh").disabled = actionBusy;
   if ($("files-record")) $("files-record").disabled = actionBusy;
   $("files-up").disabled = !state.filesPath || actionBusy;
+  const removeIgnoredBlocked = partial || restoreBlocked;
+  if ($("files-remove-ignored")) {
+    $("files-remove-ignored").disabled = removeIgnoredBlocked;
+    $("files-remove-ignored").title = partial
+      ? "Partial backups have no completed record to edit"
+      : restoreBlocked
+        ? "Stop the active backup or restore before removing files"
+        : "Remove every ignored path from this revision (authentication required)";
+  }
+  if ($("files-ignored-dir")) {
+    $("files-ignored-dir").classList.toggle("hidden", !state.filesListingIgnored);
+  }
+  if ($("files-ignored-only") && $("files-ignored-only").checked !== state.filesIgnoredOnly) {
+    $("files-ignored-only").checked = state.filesIgnoredOnly;
+  }
   renderFilesBreadcrumb();
   if (state.filesLoading) {
     body.innerHTML = '<tr><td colspan="6" class="empty">Loading backup files…</td></tr>';
@@ -1069,15 +1090,26 @@ function renderFiles() {
     return;
   }
   const filter = (state.filesFilter || "").trim().toLowerCase();
-  const entries = (state.filesEntries || []).filter((e) => !filter || e.name.toLowerCase().includes(filter));
+  let entries = (state.filesEntries || []).filter((e) => !filter || e.name.toLowerCase().includes(filter));
+  if (state.filesIgnoredOnly) entries = entries.filter((e) => e.ignored);
   if (!entries.length) {
-    const message = state.filesEntries.length ? "No matching entries." : "This folder is empty.";
+    let message;
+    if (state.filesIgnoredOnly) {
+      message = (state.filesEntries || []).some((e) => e.ignored)
+        ? "No matching ignored entries."
+        : "No ignored entries in this folder.";
+    } else {
+      message = state.filesEntries.length ? "No matching entries." : "This folder is empty.";
+    }
     body.innerHTML = `<tr><td colspan="6" class="empty">${message}</td></tr>`;
     return;
   }
   body.innerHTML = entries.map((entry) => {
     const kind = entry.isDir ? "Folder" : entry.isSymlink ? "Symlink" : "File";
     const icon = entry.isDir ? "▸" : entry.isSymlink ? "↗" : "·";
+    const ignoredBadge = entry.ignored
+      ? '<span class="ignored-badge" title="This path matches a current ignore rule">Ignored</span>'
+      : "";
     const name = entry.isDir
       ? `<button class="link-button" type="button" data-files-open="${esc(entry.path)}">${esc(entry.name)}</button>`
       : `<span>${esc(entry.name)}</span>`;
@@ -1122,8 +1154,8 @@ function renderFiles() {
     const remove = removeBlocked
       ? `<button class="link-button" type="button" disabled title="${removeTitle}">Remove</button>`
       : `<button class="link-button" type="button" data-files-remove="${esc(entry.path)}">Remove</button>`;
-    return `<tr>
-      <td><div class="files-name"><span class="files-icon${entry.isDir ? "" : " file"}">${icon}</span>${name}</div></td>
+    return `<tr${entry.ignored ? ' class="files-ignored-row"' : ""}>
+      <td><div class="files-name"><span class="files-icon${entry.isDir ? "" : " file"}">${icon}</span>${name}${ignoredBadge}</div></td>
       <td>${kind}</td>
       <td>${size}</td>
       <td>${modified}</td>
@@ -1136,6 +1168,7 @@ function renderFiles() {
 async function refreshFiles() {
   if (demo || !invoke || !state.config?.bucket) {
     state.filesEntries = [];
+    state.filesListingIgnored = false;
     state.filesLoading = false;
     state.filesError = demo
       ? "Preview mode — the file explorer needs the macOS build."
@@ -1149,6 +1182,7 @@ async function refreshFiles() {
   const requestId = ++state.filesRequest;
   state.filesLoading = true;
   state.filesEntries = [];
+  state.filesListingIgnored = false;
   state.filesError = "";
   state.filesNotice = "";
   resetVersionCounts();
@@ -1173,6 +1207,7 @@ async function refreshFiles() {
         const result = await invoke("list_partial_entries", { path: state.filesPath });
         if (requestId !== state.filesRequest) return;
         state.filesEntries = result.entries || [];
+        state.filesListingIgnored = !!result.ignored;
         state.filesResolvedRecord = "partial";
         state.filesPath = result.path || state.filesPath;
         if (!state.filesEntries.length) {
@@ -1182,6 +1217,7 @@ async function refreshFiles() {
         if (requestId !== state.filesRequest) return;
         const message = String(e);
         state.filesEntries = [];
+        state.filesListingIgnored = false;
         state.filesError = message;
         if (message.toLowerCase().includes("partial backup")) {
           state.status = { ...state.status, partialAvailable: false };
@@ -1216,11 +1252,13 @@ async function refreshFiles() {
     });
     if (requestId !== state.filesRequest) return;
     state.filesEntries = result.entries || [];
+    state.filesListingIgnored = !!result.ignored;
     state.filesResolvedRecord = result.recordKey || "";
     state.filesPath = result.path || state.filesPath;
   } catch (e) {
     if (requestId !== state.filesRequest) return;
     state.filesEntries = [];
+    state.filesListingIgnored = false;
     state.filesError = String(e);
   } finally {
     if (requestId === state.filesRequest) {
@@ -1258,6 +1296,10 @@ async function ignoreFilesEntry(path) {
         ];
         if ($("excludes")) $("excludes").value = state.config.excludePatterns.join("\n");
       }
+      for (const entry of state.filesEntries || []) {
+        if (entry.path === path) entry.ignored = true;
+      }
+      renderFiles();
       toast(`Ignored ${path} in future backups.`);
     } else {
       toast(`${path} is already ignored.`);
@@ -1304,6 +1346,54 @@ async function removeFilesEntry(path) {
     }
     toast(`Removed ${path} from this backup revision.`);
     await refreshFiles();
+  } catch (e) {
+    toast(String(e), true);
+  } finally {
+    state.filesActionBusy = false;
+    renderFiles();
+  }
+}
+
+async function removeIgnoredFiles() {
+  if (demo || !invoke) return toast("Preview mode — file actions are not available.", true);
+  if (state.filesRecordKey === "partial") {
+    return toast("Partial backups have no completed record to edit.", true);
+  }
+  if (state.status?.running || state.status?.restoring || state.status?.editing || state.filesActionBusy) {
+    return toast("Stop the active backup or restore before removing files.", true);
+  }
+  const authed = await authorizeSensitive("remove");
+  if (!authed) return;
+  const ok = await confirmAction({
+    title: "Remove all ignored paths?",
+    message: "Remove every path that matches the current ignore rules from this backup revision?",
+    detail: "This cannot be undone. Other backup revisions keep their copies. The ignore rules themselves are not changed.",
+    confirmLabel: "Remove all ignored",
+    danger: true,
+  });
+  if (!ok) {
+    await clearSensitiveAuthorization();
+    return;
+  }
+  state.filesActionBusy = true;
+  renderFiles();
+  try {
+    const summary = await invoke("remove_ignored_entries", {
+      recordKey: state.filesRecordKey || null,
+    });
+    const removed = Number(summary?.removedEntries || 0);
+    const files = Number(summary?.removedFiles || 0);
+    if (removed > 0) {
+      if (state.filesPath && state.filesEntries.every((entry) => entry.ignored)) {
+        state.filesPath = "";
+        state.filesFilter = "";
+        if ($("files-filter")) $("files-filter").value = "";
+      }
+      toast(`Removed ${removed} ignored ${removed === 1 ? "entry" : "entries"} (${files} ${files === 1 ? "file" : "files"}) from this backup revision.`);
+      await refreshFiles();
+    } else {
+      toast("No ignored entries remain in this revision.");
+    }
   } catch (e) {
     toast(String(e), true);
   } finally {
@@ -2159,7 +2249,9 @@ function bind() {
     state.filesRecordKey = $("files-record").value;
     state.filesPath = "";
     state.filesFilter = "";
+    state.filesIgnoredOnly = false;
     $("files-filter").value = "";
+    if ($("files-ignored-only")) $("files-ignored-only").checked = false;
     refreshFiles();
   });
   $("files-up").addEventListener("click", () => openFilesDir(filesParentPath(state.filesPath)));
@@ -2167,6 +2259,11 @@ function bind() {
     state.filesFilter = event.target.value;
     renderFiles();
   });
+  $("files-ignored-only").addEventListener("change", (event) => {
+    state.filesIgnoredOnly = !!event.target.checked;
+    renderFiles();
+  });
+  $("files-remove-ignored").addEventListener("click", removeIgnoredFiles);
   $("files-breadcrumb").addEventListener("click", (event) => {
     const target = event.target.closest("[data-files-path]");
     if (target) openFilesDir(target.getAttribute("data-files-path"));

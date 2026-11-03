@@ -501,6 +501,77 @@ async fn remove_backup_entry(
     .map_err(err)?
 }
 
+/// Remove every entry that the current ignore rules match from a completed
+/// record. This is the bulk counterpart of `remove_backup_entry` and requires
+/// the same one-shot authentication grant.
+#[tauri::command]
+async fn remove_ignored_entries(
+    state: State<'_, SharedState>,
+    record_key: Option<String>,
+) -> Result<edit::RemoveIgnoredSummary, String> {
+    consume_sensitive_grant(state.inner(), "remove")?;
+    {
+        let mut status = state.status.lock();
+        if status.running || status.restoring || status.editing {
+            return Err("stop the active backup or restore before removing files".into());
+        }
+        status.editing = true;
+        status.phase = "editing".into();
+        status.detail = "Removing ignored paths from backup…".into();
+        status.last_error = None;
+    }
+    let cfg = state.config.lock().clone();
+    if let Err(e) = config::validate(&cfg) {
+        state.status.lock().fail(err(&e));
+        return Err(err(e));
+    }
+    let status_arc = state.status.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = match new_store(&cfg) {
+            Ok(store) => store,
+            Err(e) => {
+                status_arc.lock().fail(err(&e));
+                return Err(err(e));
+            }
+        };
+        let cancel = CancelToken::new();
+        let summary = match edit::remove_ignored_entries(
+            &cfg,
+            store.as_ref(),
+            record_key.as_deref(),
+            &cancel,
+        ) {
+            Ok(summary) => summary,
+            Err(e) => {
+                status_arc.lock().fail(err(&e));
+                return Err(err(e));
+            }
+        };
+        if summary.index_saved && summary.removed_entries > 0 {
+            match retention::prune_unreferenced(&cfg, store.as_ref(), &cancel) {
+                Ok(gc) => logging::info(format!(
+                    "removed {} ignored entries from backup; reclaimed {} objects",
+                    summary.removed_entries, gc.objects_deleted
+                )),
+                Err(e) => logging::warn(format!(
+                    "removed {} ignored entries from backup, but garbage collection failed: {e}",
+                    summary.removed_entries
+                )),
+            }
+        }
+        {
+            let mut status = status_arc.lock();
+            status.editing = false;
+            status.phase = "idle".into();
+            status.detail.clear();
+            status.last_finished_at = Some(chrono::Utc::now());
+        }
+        Ok(summary)
+    })
+    .await
+    .map_err(err)?
+}
+
 #[tauri::command]
 async fn list_backup_entries(
     state: State<'_, SharedState>,
@@ -1657,6 +1728,7 @@ pub fn run() {
             pick_restore_destination,
             ignore_backup_entry,
             remove_backup_entry,
+            remove_ignored_entries,
             storage_estimate,
             diff_backup,
             diff_backup_file,

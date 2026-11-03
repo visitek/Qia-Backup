@@ -108,6 +108,20 @@ pub struct RemoveSummary {
     pub index_saved: bool,
 }
 
+/// Result of removing every ignored entry from a completed record.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveIgnoredSummary {
+    pub record_key: String,
+    /// Number of files removed, including files inside removed directories.
+    pub removed_files: u64,
+    /// Number of top-level ignored entries removed from their parent directory.
+    pub removed_entries: u64,
+    /// False when the record was updated but the new tree blobs could not be
+    /// persisted in the index. The record remains valid and recoverable.
+    pub index_saved: bool,
+}
+
 struct TreeWriter<'a> {
     store: &'a dyn BlobStore,
     root: String,
@@ -272,15 +286,7 @@ fn remove_child(
 
     let removed_files = if components.len() == 1 {
         let (_, removed) = tree.children.remove(position);
-        if removed.is_tree || Node::mode_is_dir(removed.mac_st_mode) {
-            removed.contained_files_count
-        } else if Node::mode_is_symlink(removed.mac_st_mode) {
-            0
-        } else if removed.mac_st_mode & libc::S_IFMT as u32 == libc::S_IFREG as u32 {
-            1
-        } else {
-            0
-        }
+        count_node_files(&removed)
     } else {
         let child = tree.children[position].1.clone();
         let (new_child, removed_files) = remove_child(
@@ -300,6 +306,184 @@ fn remove_child(
     updated.contained_files_count = updated.contained_files_count.saturating_sub(removed_files);
     updated.tree_blob_loc = Some(writer.store_tree(&tree)?);
     Ok((updated, removed_files))
+}
+
+fn count_node_files(node: &Node) -> u64 {
+    if node.is_tree || Node::mode_is_dir(node.mac_st_mode) {
+        node.contained_files_count
+    } else if Node::mode_is_symlink(node.mac_st_mode) {
+        0
+    } else if node.mac_st_mode & libc::S_IFMT as u32 == libc::S_IFREG as u32 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Remove every path that the current ignore rules match from a completed
+/// record.
+///
+/// Directories are filtered recursively; when a directory matches, its whole
+/// subtree is removed without being visited. Ancestor trees are rewritten only
+/// when something below them changed. Other revisions are untouched.
+pub fn remove_ignored_entries(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    record_key: Option<&str>,
+    cancel: &CancelToken,
+) -> Result<RemoveIgnoredSummary> {
+    cancel.check()?;
+    let root = config.key_root();
+    if record_key == Some("partial") {
+        return Err(BackupError::Other(
+            "partial backups have no completed record to remove from".into(),
+        ));
+    }
+
+    let record_key = restore::resolve_record_key(config, store, record_key)?;
+    let keys = restore::load_keys(config, store, &root)?;
+    let mut record = record::load_record(store, &record_key, keys.as_ref())?;
+    let root_node = record.root_node()?;
+    if !root_node.is_tree {
+        return Err(BackupError::Codec(
+            "backup record root is not a directory".into(),
+        ));
+    }
+
+    let matcher = crate::core::engine::build_excludes(&config.exclude_patterns)?;
+
+    // A partially loaded index must never be saved over a complete one. If the
+    // index is empty while records exist, rebuild it first, exactly like a
+    // normal backup does. This keeps later garbage collection safe.
+    let mut index = BlobIndex::load(store, &root, config)?;
+    if index.blobs.is_empty() {
+        index =
+            crate::core::recover::rebuild_index(config, store, keys.as_ref(), cancel, |detail| {
+                logging::debug(detail)
+            })?;
+    }
+
+    let mut writer = TreeWriter {
+        store,
+        root: root.clone(),
+        index,
+        encryptor: keys.clone().map(ObjectEncryptor::new),
+    };
+    let (new_root, removed_files, removed_entries) = remove_ignored_from_node(
+        store,
+        &root,
+        keys.as_ref(),
+        &mut writer,
+        &root_node,
+        "",
+        &matcher,
+        cancel,
+    )?;
+
+    if removed_entries == 0 {
+        return Ok(RemoveIgnoredSummary {
+            record_key,
+            removed_files: 0,
+            removed_entries: 0,
+            index_saved: true,
+        });
+    }
+
+    record.node = base64::engine::general_purpose::STANDARD
+        .encode(codec::encode_node(&new_root, record.node_tree_version));
+    record.files_count = record.files_count.saturating_sub(removed_files);
+
+    let bytes = record::encode_record(&record, writer.encryptor.as_mut())?;
+    store.put(&record_key, &bytes)?;
+
+    let index_saved = match writer.index.save_and_clear(store, &root, config) {
+        Ok(()) => true,
+        Err(e) => {
+            logging::warn(format!(
+                "removed ignored entries from {record_key}, but saving the blob index failed: {e}"
+            ));
+            false
+        }
+    };
+    logging::info(format!(
+        "removed {removed_entries} ignored entr{} ({removed_files} files) from record {record_key}",
+        if removed_entries == 1 { "y" } else { "ies" }
+    ));
+    Ok(RemoveIgnoredSummary {
+        record_key,
+        removed_files,
+        removed_entries,
+        index_saved,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remove_ignored_from_node(
+    store: &dyn BlobStore,
+    root: &str,
+    keys: Option<&crate::core::crypto::MasterKeys>,
+    writer: &mut TreeWriter<'_>,
+    node: &Node,
+    parent_path: &str,
+    matcher: &globset::GlobSet,
+    cancel: &CancelToken,
+) -> Result<(Node, u64, u64)> {
+    cancel.check()?;
+    if !node.is_tree {
+        return Ok((node.clone(), 0, 0));
+    }
+    let loc = node
+        .tree_blob_loc
+        .as_ref()
+        .ok_or_else(|| BackupError::Codec("directory node has no tree location".into()))?;
+    let tree = record::load_tree(store, root, loc, keys)?;
+    let mut kept = Vec::with_capacity(tree.children.len());
+    let mut removed_files = 0;
+    let mut removed_entries = 0;
+    for (name, child) in tree.children {
+        let child_path = if parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        if matcher.is_match(&child_path) || matcher.is_match(&name) {
+            removed_files += count_node_files(&child);
+            removed_entries += 1;
+            continue;
+        }
+        if child.is_tree || Node::mode_is_dir(child.mac_st_mode) {
+            let (new_child, child_files, child_entries) = remove_ignored_from_node(
+                store,
+                root,
+                keys,
+                writer,
+                &child,
+                &child_path,
+                matcher,
+                cancel,
+            )?;
+            if child_entries > 0 {
+                removed_files += child_files;
+                removed_entries += child_entries;
+                kept.push((name, new_child));
+            } else {
+                kept.push((name, child));
+            }
+        } else {
+            kept.push((name, child));
+        }
+    }
+
+    if removed_entries == 0 {
+        return Ok((node.clone(), 0, 0));
+    }
+    let mut updated = node.clone();
+    updated.contained_files_count = updated.contained_files_count.saturating_sub(removed_files);
+    updated.tree_blob_loc = Some(writer.store_tree(&Tree {
+        version: tree.version,
+        children: kept,
+    })?);
+    Ok((updated, removed_files, removed_entries))
 }
 
 #[cfg(test)]
@@ -642,5 +826,88 @@ mod remove_tests {
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&dst).ok();
         std::fs::remove_dir_all(&restore_dir).ok();
+    }
+
+    #[test]
+    fn removes_all_ignored_entries_recursively_and_keeps_the_rest() {
+        let src = temp_path("edit-ignored-src");
+        let dst = temp_path("edit-ignored-store");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::create_dir_all(src.join("cache/deep")).unwrap();
+        std::fs::write(src.join("keep.txt"), b"keep").unwrap();
+        std::fs::write(src.join("drop.log"), b"drop").unwrap();
+        std::fs::write(src.join("nested/child.txt"), b"child").unwrap();
+        std::fs::write(src.join("cache/one.bin"), b"one").unwrap();
+        std::fs::write(src.join("cache/deep/two.bin"), b"two").unwrap();
+
+        let store = LocalStore::new(&dst).unwrap();
+        let mut config = test_config(&src);
+        backup(&mut config, &store);
+        let key = latest(&config, &store);
+
+        add_ignore_path(&mut config, "drop.log").unwrap();
+        add_ignore_path(&mut config, "cache").unwrap();
+
+        let listing = restore::list_entries(&config, &store, Some(&key), "").unwrap();
+        assert!(!listing.ignored);
+        assert!(
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == "drop.log")
+                .unwrap()
+                .ignored
+        );
+        assert!(
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == "cache")
+                .unwrap()
+                .ignored
+        );
+        let cache = restore::list_entries(&config, &store, Some(&key), "cache").unwrap();
+        assert!(cache.ignored, "the browsed ignored directory is flagged");
+        assert!(cache.entries.iter().all(|entry| entry.ignored));
+
+        let summary =
+            remove_ignored_entries(&config, &store, Some(&key), &CancelToken::new()).unwrap();
+        assert_eq!(summary.record_key, key);
+        assert_eq!(summary.removed_entries, 2);
+        assert_eq!(summary.removed_files, 3);
+        assert!(summary.index_saved);
+
+        let names = list(&config, &store, &key, "");
+        assert_eq!(names, vec!["nested", "keep.txt"]);
+        assert!(
+            restore::list_entries(&config, &store, Some(&key), "cache").is_err(),
+            "the ignored directory was removed from this revision"
+        );
+        assert_eq!(list(&config, &store, &key, "nested"), vec!["child.txt"]);
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn removing_ignored_entries_is_a_noop_when_nothing_matches() {
+        let src = temp_path("edit-ignored-noop-src");
+        let dst = temp_path("edit-ignored-noop-store");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("keep.txt"), b"keep").unwrap();
+
+        let store = LocalStore::new(&dst).unwrap();
+        let mut config = test_config(&src);
+        backup(&mut config, &store);
+        let key = latest(&config, &store);
+
+        let summary =
+            remove_ignored_entries(&config, &store, Some(&key), &CancelToken::new()).unwrap();
+        assert_eq!(summary.removed_entries, 0);
+        assert_eq!(summary.removed_files, 0);
+        assert_eq!(list(&config, &store, &key, ""), vec!["keep.txt"]);
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
     }
 }

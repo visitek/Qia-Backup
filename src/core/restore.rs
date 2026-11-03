@@ -52,6 +52,9 @@ pub struct BackupEntry {
     pub size: u64,
     pub files_count: u64,
     pub mtime_sec: i64,
+    /// True when this entry is excluded by the current ignore configuration.
+    /// It can still be present in an older revision created before the rule.
+    pub ignored: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +62,8 @@ pub struct BackupEntry {
 pub struct BackupListing {
     pub record_key: String,
     pub path: String,
+    /// True when the directory being browsed is itself ignored.
+    pub ignored: bool,
     pub entries: Vec<BackupEntry>,
 }
 
@@ -185,11 +190,14 @@ pub fn list_entries(
         .map(|(name, child)| backup_entry_from_node(&normalized, name, child))
         .collect();
     sort_backup_entries(&mut entries);
-    Ok(BackupListing {
+    let mut listing = BackupListing {
         record_key: resolved_key,
         path: normalized,
+        ignored: false,
         entries,
-    })
+    };
+    mark_listing_ignored(&mut listing, config)?;
+    Ok(listing)
 }
 
 fn backup_entry_from_node(parent: &str, name: String, child: Node) -> BackupEntry {
@@ -205,7 +213,29 @@ fn backup_entry_from_node(parent: &str, name: String, child: Node) -> BackupEntr
         size: child.item_size,
         files_count: child.contained_files_count,
         mtime_sec: child.mtime_sec,
+        ignored: false,
     }
+}
+
+/// Annotate a directory listing with the current ignore rules.
+///
+/// The backup walker matches a path either by its full relative path or by its
+/// basename (see `engine::is_excluded`), so the explorer uses the same matcher.
+/// When the browsed directory itself is ignored, every child is treated as
+/// ignored because the walker would never descend into it.
+fn mark_listing_ignored(listing: &mut BackupListing, config: &AppConfig) -> Result<()> {
+    // A malformed exclude pattern must not make the explorer unusable; the
+    // backup run will surface the configuration error when it starts.
+    let Ok(matcher) = crate::core::engine::build_excludes(&config.exclude_patterns) else {
+        return Ok(());
+    };
+    let parent_ignored = !listing.path.is_empty() && matcher.is_match(&listing.path);
+    listing.ignored = parent_ignored;
+    for entry in &mut listing.entries {
+        entry.ignored =
+            parent_ignored || matcher.is_match(&entry.path) || matcher.is_match(&entry.name);
+    }
+    Ok(())
 }
 
 fn sort_backup_entries(entries: &mut [BackupEntry]) {
@@ -333,11 +363,14 @@ pub fn list_partial_entries(
         .map(|(name, child)| backup_entry_from_node(&normalized, name, child))
         .collect();
     sort_backup_entries(&mut entries);
-    Ok(BackupListing {
+    let mut listing = BackupListing {
         record_key: "partial".into(),
         path: normalized,
+        ignored: false,
         entries,
-    })
+    };
+    mark_listing_ignored(&mut listing, config)?;
+    Ok(listing)
 }
 
 /// Read one file's text content from the live partial backup for the viewer.

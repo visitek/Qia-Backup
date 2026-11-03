@@ -234,6 +234,7 @@
               <select id="files-record"></select>
             </label>
             <button class="button" id="files-refresh">Refresh</button>
+            <button class="button danger-ghost" id="files-remove-ignored" type="button" title="Remove every ignored path from this revision (authentication required)">Remove all ignored</button>
           </div>
         </div>
         <div class="files-layout">
@@ -242,8 +243,15 @@
               <div class="files-nav">
                 <button class="button subtle" id="files-up" type="button" title="Go to the parent folder">↑ Up</button>
                 <div class="breadcrumb" id="files-breadcrumb"></div>
+                <span class="pill warn hidden" id="files-ignored-dir" title="The current folder matches an ignore rule">Ignored path</span>
               </div>
-              <input id="files-filter" type="search" placeholder="Filter this folder…" />
+              <div class="files-bar-filters">
+                <input id="files-filter" type="search" placeholder="Filter this folder…" />
+                <label class="files-ignored-toggle" title="Show only entries matched by the current ignore rules">
+                  <input type="checkbox" id="files-ignored-only" />
+                  <span>Ignored only</span>
+                </label>
+              </div>
             </div>
             <div class="table-wrap files-table-wrap">
               <table class="table" id="files-table">
