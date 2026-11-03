@@ -541,10 +541,11 @@ written by other tools.
   upload. Packs default to 64 MiB, so a slow uplink can still cap throughput.
   In-flight upload memory is bounded by the configured pack size and worker
   count.
-- The directory walk itself is still single-threaded. Incremental runs visit
-  every directory and stat every file to detect changes, although unchanged
-  file contents are not read. A first backup also performs one extra metadata
-  pass to estimate totals for the progress bar.
+- The directory walk that builds the backup record is still single-threaded.
+  Incremental runs visit every directory and stat every file to detect changes,
+  although unchanged file contents are not read. A first backup also performs
+  an extra metadata pass, counted in parallel, to estimate totals for the
+  progress bar.
 - No WORM/Object Lock and no S3 lifecycle management.
 - Credentials and the encryption password are stored in the macOS Keychain;
   `config.json` contains only non-secret settings. Keep a separate copy of the

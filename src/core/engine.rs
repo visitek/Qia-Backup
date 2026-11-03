@@ -10,14 +10,14 @@
 //! read as zeros today; using SEEK_HOLE/SEEK_DATA would cut both read and upload
 //! volume.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt as MacMetadataExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2079,6 +2079,81 @@ fn validate_included_folders(config: &AppConfig, walk_root: &Path) -> Result<()>
 /// Count files and logical bytes under `walk_root` without reading file
 /// contents. This mirrors the engine's exclusion and mount-boundary rules
 /// closely enough to seed a progress estimate for the first backup.
+struct CountState {
+    queue: VecDeque<(PathBuf, String, bool)>,
+    /// Directories queued or currently being listed.
+    pending: usize,
+}
+
+type CountShared = Arc<(Mutex<CountState>, Condvar)>;
+
+fn count_directory(
+    dir: &Path,
+    rel: &str,
+    include_all: bool,
+    excludes: &GlobSet,
+    includes: &IncludeFilter,
+    root_dev: u64,
+    cancel: &CancelToken,
+    shared: &CountShared,
+    files: &AtomicU64,
+    bytes: &AtomicU64,
+    skipped: &AtomicU64,
+) -> Result<()> {
+    cancel.check()?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Protected system paths are expected on a full-volume backup.
+            // Keep the detail available at debug level, but log only one
+            // summary line so the activity log stays readable.
+            logging::debug(format!("could not count {}: {e}", dir.display()));
+            skipped.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        cancel.check()?;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        if excludes.is_match(&child_rel) || excludes.is_match(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        let decision = if include_all {
+            IncludeDecision::All
+        } else {
+            includes.child_decision(&child_rel, meta.is_dir())
+        };
+        if meta.is_dir() {
+            if decision != IncludeDecision::Skip && meta.dev() == root_dev {
+                let mut state = shared.0.lock().expect("count queue poisoned");
+                state
+                    .queue
+                    .push_back((path, child_rel, decision == IncludeDecision::All));
+                state.pending += 1;
+                drop(state);
+                shared.1.notify_one();
+            }
+        } else if meta.is_file() && decision == IncludeDecision::All {
+            files.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(meta.size(), Ordering::Relaxed);
+        }
+    }
+    Ok(())
+}
+
 fn estimate_source_totals(
     config: &AppConfig,
     walk_root: &Path,
@@ -2089,70 +2164,114 @@ fn estimate_source_totals(
     let includes = IncludeFilter::new(config)?;
     let root_meta = fs::symlink_metadata(walk_root).at(walk_root)?;
     let root_dev = root_meta.dev();
-    let mut stack = vec![(
+
+    let mut queue = VecDeque::new();
+    queue.push_back((
         walk_root.to_path_buf(),
         String::new(),
         includes.includes_all(""),
-    )];
-    let mut files = 0u64;
-    let mut bytes = 0u64;
-    let mut skipped = 0u64;
-    let mut last_report = Instant::now();
+    ));
+    let shared: CountShared =
+        Arc::new((Mutex::new(CountState { queue, pending: 1 }), Condvar::new()));
+    let files = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(AtomicU64::new(0));
+    let skipped = Arc::new(AtomicU64::new(0));
+    let error = Arc::new(Mutex::new(None::<BackupError>));
+    let workers = max_scan_workers();
+    let worker_cancel = cancel.clone();
 
-    while let Some((dir, rel, include_all)) = stack.pop() {
-        cancel.check()?;
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                // Protected system paths are expected on a full-volume backup.
-                // Keep the detail available at debug level, but log only one
-                // summary line so the activity log stays readable.
-                logging::debug(format!("could not count {}: {e}", dir.display()));
-                skipped += 1;
-                continue;
-            }
-        };
-        for entry in entries {
-            cancel.check()?;
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().to_string();
-            let child_rel = if rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel}/{name}")
-            };
-            if excludes.is_match(&child_rel) || excludes.is_match(&name) {
-                continue;
-            }
-            let path = entry.path();
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(_) => continue,
-            };
-            let decision = if include_all {
-                IncludeDecision::All
-            } else {
-                includes.child_decision(&child_rel, meta.is_dir())
-            };
-            if meta.is_dir() {
-                if decision != IncludeDecision::Skip && meta.dev() == root_dev {
-                    stack.push((path, child_rel, decision == IncludeDecision::All));
+    let (files, bytes) = std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let shared = Arc::clone(&shared);
+            let files = Arc::clone(&files);
+            let bytes = Arc::clone(&bytes);
+            let skipped = Arc::clone(&skipped);
+            let error = Arc::clone(&error);
+            let cancel = worker_cancel.clone();
+            let excludes = &excludes;
+            let includes = &includes;
+            scope.spawn(move || loop {
+                if error.lock().expect("count error poisoned").is_some() {
+                    break;
                 }
-            } else if meta.is_file() && decision == IncludeDecision::All {
-                files += 1;
-                bytes = bytes.saturating_add(meta.size());
-            }
-        }
-        if last_report.elapsed() >= std::time::Duration::from_secs(1) {
-            progress(ProgressEvent::Phase {
-                name: "counting".into(),
-                detail: format!("{files} files found so far, {bytes} bytes"),
+                let task = {
+                    let mut state = shared.0.lock().expect("count queue poisoned");
+                    loop {
+                        if let Some(task) = state.queue.pop_front() {
+                            break Some(task);
+                        }
+                        if state.pending == 0 {
+                            break None;
+                        }
+                        state = shared.1.wait(state).expect("count queue poisoned");
+                    }
+                };
+                let Some((dir, rel, include_all)) = task else {
+                    break;
+                };
+                if let Err(e) = count_directory(
+                    &dir,
+                    &rel,
+                    include_all,
+                    excludes,
+                    includes,
+                    root_dev,
+                    &cancel,
+                    &shared,
+                    &files,
+                    &bytes,
+                    &skipped,
+                ) {
+                    let mut slot = error.lock().expect("count error poisoned");
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                    drop(slot);
+                    let mut state = shared.0.lock().expect("count queue poisoned");
+                    state.pending = 0;
+                    state.queue.clear();
+                    drop(state);
+                    shared.1.notify_all();
+                    break;
+                }
+                let mut state = shared.0.lock().expect("count queue poisoned");
+                state.pending = state.pending.saturating_sub(1);
+                let done = state.pending == 0;
+                drop(state);
+                if done {
+                    shared.1.notify_all();
+                }
             });
-            last_report = Instant::now();
         }
-    }
+
+        let mut last_report = Instant::now();
+        loop {
+            let pending = shared.0.lock().expect("count queue poisoned").pending;
+            let failed = error.lock().expect("count error poisoned").is_some();
+            if failed || pending == 0 {
+                break;
+            }
+            if last_report.elapsed() >= Duration::from_secs(1) {
+                progress(ProgressEvent::Phase {
+                    name: "counting".into(),
+                    detail: format!(
+                        "{} files found so far, {} bytes",
+                        files.load(Ordering::Relaxed),
+                        bytes.load(Ordering::Relaxed)
+                    ),
+                });
+                last_report = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        if let Some(e) = error.lock().expect("count error poisoned").take() {
+            return Err(e);
+        }
+        Ok((files.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed)))
+    })?;
+
+    let skipped = skipped.load(Ordering::Relaxed);
     if skipped > 0 {
         let noun = if skipped == 1 {
             "directory"
