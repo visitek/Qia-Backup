@@ -77,6 +77,7 @@ const state = {
   contentRequest: 0,
   confirmResolve: null,
   speedHistory: [],
+  lastSpeedBps: 0,
   lastSpeedSampleAt: 0,
   storageEstimate: null,
   estimateAt: 0,
@@ -572,7 +573,13 @@ function renderTransferSpark() {
 
 function renderTransfer(s) {
   const active = !!s.running && !s.restoring;
-  const speed = Number(s.uploadSpeedBps || 0);
+  const measured = Number(s.uploadSpeedBps || 0);
+  // The backend reports speed from uploads that *completed* in a short window.
+  // A large pack can take longer than that window, so the value drops back to
+  // zero between completions even though uploads are still running. Keep the
+  // last measured rate instead of flashing "measuring…" again.
+  if (measured > 0) state.lastSpeedBps = measured;
+  const speed = state.lastSpeedBps;
   const target = Number(s.uploadTargetThreads || 0);
   const max = Number(s.uploadMaxThreads || 0);
   const inFlight = Number(s.uploadInFlight || 0);
@@ -715,6 +722,7 @@ function updateStatus() {
   } else if (!state.lastRunning && running) {
     // Make the empty history state explain the run that is in progress.
     state.speedHistory = [];
+    state.lastSpeedBps = 0;
     state.lastSpeedSampleAt = 0;
     renderTransferSpark();
     renderBackups();
