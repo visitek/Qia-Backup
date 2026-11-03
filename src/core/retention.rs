@@ -27,9 +27,16 @@ pub struct PruneSummary {
     pub records_kept: usize,
     pub records_deleted: usize,
     pub objects_deleted: usize,
+    pub objects_scanned: usize,
     pub blobs_referenced: usize,
     pub dry_run: bool,
 }
+
+/// Only these prefixes contain content-addressed data objects. Metadata,
+/// records, the index, journals and the partial-run marker are never scanned.
+const ORPHAN_GC_PREFIXES: &[&str] = &["blobpacks/", "standardobjects/", "treepacks/"];
+const ORPHAN_LIST_PAGE: u32 = 1000;
+const ORPHAN_DELETE_WORKERS: usize = 8;
 
 pub fn prune(
     config: &AppConfig,
@@ -80,12 +87,13 @@ pub fn prune(
             ))
         })?;
         let node = rec.root_node()?;
-        collect_node_blobs(
+        collect_node_refs(
             store,
             &root,
             master_keys.as_ref(),
             &node,
-            &mut referenced,
+            Some(&mut referenced),
+            None,
             &mut visited_trees,
             cancel,
         )?;
@@ -166,12 +174,13 @@ pub fn prune_unreferenced(
             ))
         })?;
         let node = rec.root_node()?;
-        collect_node_blobs(
+        collect_node_refs(
             store,
             &root,
             master_keys.as_ref(),
             &node,
-            &mut referenced,
+            Some(&mut referenced),
+            None,
             &mut visited_trees,
             cancel,
         )?;
@@ -185,7 +194,7 @@ pub fn prune_unreferenced(
         records_deleted: 0,
         objects_deleted: 0,
         blobs_referenced: referenced.len(),
-        dry_run: false,
+        ..PruneSummary::default()
     };
     if removed.is_empty() {
         return Ok(summary);
@@ -205,6 +214,181 @@ pub fn prune_unreferenced(
         summary.records_kept, summary.objects_deleted
     ));
     Ok(summary)
+}
+
+/// Remove objects under the data prefixes that are not referenced by the base
+/// index, its journals, or any current backup record.
+///
+/// This closes the gap left by normal retention: an upload that completed just
+/// before a crash was never journaled, so it is absent from the index and
+/// invisible to [`BlobIndex::prune_to`]. Such objects are still present in the
+/// bucket and can accumulate after repeated interruptions.
+///
+/// Callers must ensure no backup or upload is running. The scan is
+/// memory-bounded: it pages through the store and keeps only distinct object
+/// paths (roughly one per pack), never the full blob map or object listing.
+pub fn prune_orphans(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    cancel: &CancelToken,
+    dry_run: bool,
+) -> Result<PruneSummary> {
+    let root = config.key_root();
+    let index = BlobIndex::load(store, &root, config)?;
+    prune_orphans_with_index(config, store, &index, cancel, dry_run)
+}
+
+/// Variant used after a backup, where the just-saved index is already in
+/// memory. This avoids re-reading and re-parsing a potentially multi-million
+/// entry index from storage.
+pub fn prune_orphans_with_index(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    index: &BlobIndex,
+    cancel: &CancelToken,
+    dry_run: bool,
+) -> Result<PruneSummary> {
+    let root = config.key_root();
+    index.check_consistency()?;
+
+    let record_keys = record::list_record_keys(store, &root, &config.backup_set_uuid)?;
+    let master_keys = if record_keys.is_empty() {
+        None
+    } else {
+        load_keys(config, store, &root)?
+    };
+
+    // Live object paths, not blob IDs. Packed blobs share one path per pack, so
+    // this set stays proportional to pack count even for millions of blobs.
+    let mut live_paths: HashSet<String> = HashSet::with_capacity(index.packs.len());
+    for path in index.packs.keys() {
+        let normalized = path.trim_start_matches('/');
+        if !live_paths.contains(normalized) {
+            live_paths.insert(normalized.to_string());
+        }
+    }
+    // Unpacked blobs (large standalone objects and edited trees) have their own
+    // object path. Packed blobs are already covered by index.packs above.
+    for loc in index.blobs.values() {
+        if loc.is_packed {
+            continue;
+        }
+        let normalized = loc.relative_path.trim_start_matches('/');
+        if !live_paths.contains(normalized) {
+            live_paths.insert(normalized.to_string());
+        }
+    }
+
+    // Records are authoritative too: the index keeps one location per content
+    // ID, but an older record can reference the same content at another
+    // physical path (for example after rebuilding from records). Protect every
+    // path a record actually stores.
+    let mut visited_trees = HashSet::new();
+    for key in &record_keys {
+        cancel.check()?;
+        let rec = record::load_record(store, key, master_keys.as_ref()).map_err(|e| {
+            BackupError::Store(format!(
+                "cannot safely collect orphaned objects: failed to read record {key}: {e}"
+            ))
+        })?;
+        let node = rec.root_node()?;
+        collect_node_refs(
+            store,
+            &root,
+            master_keys.as_ref(),
+            &node,
+            None,
+            Some(&mut live_paths),
+            &mut visited_trees,
+            cancel,
+        )?;
+    }
+
+    let mut summary = PruneSummary {
+        records_before: record_keys.len(),
+        records_kept: record_keys.len(),
+        dry_run,
+        ..PruneSummary::default()
+    };
+    let root_prefix = format!("{}/", root.trim_end_matches('/'));
+
+    for prefix in ORPHAN_GC_PREFIXES {
+        let full_prefix = record::root_key(&root, prefix);
+        let mut token: Option<String> = None;
+        loop {
+            cancel.check()?;
+            let page = store.list_page(&full_prefix, token.as_deref(), ORPHAN_LIST_PAGE)?;
+            let mut orphans = Vec::new();
+            for object in &page.objects {
+                summary.objects_scanned = summary.objects_scanned.saturating_add(1);
+                let Some(relative) = object.key.strip_prefix(&root_prefix) else {
+                    // Never touch an object outside this backup set, even if a
+                    // store implementation returned an unexpected key.
+                    continue;
+                };
+                if !live_paths.contains(relative) {
+                    orphans.push(object.key.clone());
+                }
+            }
+            if dry_run {
+                summary.objects_deleted = summary.objects_deleted.saturating_add(orphans.len());
+            } else if !orphans.is_empty() {
+                summary.objects_deleted = summary
+                    .objects_deleted
+                    .saturating_add(delete_orphan_objects(store, &orphans, cancel)?);
+            }
+            match page.next {
+                Some(next) if !next.is_empty() => token = Some(next),
+                _ => break,
+            }
+        }
+    }
+
+    logging::info(format!(
+        "orphan cleanup: scanned {} objects against {} live object paths; {} {} orphaned objects",
+        summary.objects_scanned,
+        live_paths.len(),
+        if dry_run { "would delete" } else { "deleted" },
+        summary.objects_deleted
+    ));
+    Ok(summary)
+}
+
+fn delete_orphan_objects(
+    store: &dyn BlobStore,
+    keys: &[String],
+    cancel: &CancelToken,
+) -> Result<usize> {
+    let mut deleted = 0usize;
+    for batch in keys.chunks(ORPHAN_DELETE_WORKERS) {
+        cancel.check()?;
+        let results: Vec<Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|key| {
+                    scope.spawn(move || {
+                        cancel.check()?;
+                        store.delete(key)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(BackupError::Store(
+                            "orphan cleanup delete worker panicked".into(),
+                        ))
+                    })
+                })
+                .collect()
+        });
+        for result in results {
+            result?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 struct KeptKeys {
@@ -289,28 +473,31 @@ fn select_kept(keys: &[String], config: &AppConfig, now: i64) -> KeptKeys {
     KeptKeys { kept, removed }
 }
 
-fn collect_node_blobs(
+fn collect_node_refs(
     store: &dyn BlobStore,
     root: &str,
     keys: Option<&crate::core::crypto::MasterKeys>,
     node: &Node,
-    out: &mut HashSet<String>,
+    mut blobs: Option<&mut HashSet<String>>,
+    mut object_paths: Option<&mut HashSet<String>>,
     visited_trees: &mut HashSet<String>,
     cancel: &CancelToken,
 ) -> Result<()> {
     cancel.check()?;
     for loc in &node.data_blob_locs {
-        out.insert(loc.blob_identifier.clone());
+        mark_loc(loc, &mut blobs, &mut object_paths);
     }
     if let Some(loc) = &node.acl_blob_loc {
-        out.insert(loc.blob_identifier.clone());
+        mark_loc(loc, &mut blobs, &mut object_paths);
     }
     for loc in &node.xattrs_blob_locs {
-        out.insert(loc.blob_identifier.clone());
+        mark_loc(loc, &mut blobs, &mut object_paths);
     }
     if node.is_tree {
         if let Some(loc) = &node.tree_blob_loc {
-            out.insert(loc.blob_identifier.clone());
+            // Always protect this physical path, even when the same tree
+            // content was already visited at a different location.
+            mark_loc(loc, &mut blobs, &mut object_paths);
             // The same directory tree appears in every backup where it did not
             // change. Its children are identical, so walk it only once.
             if !visited_trees.insert(loc.blob_identifier.clone()) {
@@ -318,11 +505,38 @@ fn collect_node_blobs(
             }
             let tree = record::load_tree(store, root, loc, keys)?;
             for (_, child) in &tree.children {
-                collect_node_blobs(store, root, keys, child, out, visited_trees, cancel)?;
+                collect_node_refs(
+                    store,
+                    root,
+                    keys,
+                    child,
+                    blobs.as_deref_mut(),
+                    object_paths.as_deref_mut(),
+                    visited_trees,
+                    cancel,
+                )?;
             }
         }
     }
     Ok(())
+}
+
+fn mark_loc(
+    loc: &crate::core::model::BlobLoc,
+    blobs: &mut Option<&mut HashSet<String>>,
+    object_paths: &mut Option<&mut HashSet<String>>,
+) {
+    if let Some(blobs) = blobs.as_deref_mut() {
+        blobs.insert(loc.blob_identifier.clone());
+    }
+    if let Some(paths) = object_paths.as_deref_mut() {
+        // Most locs are packed and share a path already present from
+        // index.packs; avoid allocating a String for every repeated pack.
+        let normalized = loc.relative_path.trim_start_matches('/');
+        if !paths.contains(normalized) {
+            paths.insert(normalized.to_string());
+        }
+    }
 }
 
 /// Delete everything in the backup set. Does not delete the bucket.
@@ -525,5 +739,110 @@ mod tests {
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn orphan_cleanup_removes_only_untracked_data_objects() {
+        let src = std::env::temp_dir().join(format!("orphan-src-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("orphan-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("keep.txt"), b"keep me").unwrap();
+
+        let store = LocalStore::new(&dir).unwrap();
+        let mut c = cfg();
+        c.source_path = src.to_string_lossy().to_string();
+        c.schedule_minutes = 0;
+        crate::core::engine::run_backup(&mut c, &store, CancelToken::new(), &mut |_| {}).unwrap();
+
+        let root = c.key_root();
+        let live_pack = store
+            .list(&format!("{}/blobpacks/", root))
+            .unwrap()
+            .first()
+            .expect("backup pack")
+            .key
+            .clone();
+        let orphan_pack = format!(
+            "{}/blobpacks/orphan-{}.blobpack",
+            root,
+            uuid::Uuid::new_v4()
+        );
+        let orphan_std = format!("{}/standardobjects/aa/orphan", root);
+        let orphan_tree = format!("{}/treepacks/orphan", root);
+        store.put(&orphan_pack, b"orphan").unwrap();
+        store.put(&orphan_std, b"orphan").unwrap();
+        store.put(&orphan_tree, b"orphan").unwrap();
+
+        // A journal-only object is live dedupe progress even though no record
+        // references it yet.
+        let indexed_only = format!("{}/standardobjects/ff/indexed-only", root);
+        store.put(&indexed_only, b"kept").unwrap();
+        let mut blobs = std::collections::HashMap::new();
+        blobs.insert(
+            "indexed-only".into(),
+            crate::core::model::BlobLoc::unpacked(
+                "indexed-only".into(),
+                "standardobjects/ff/indexed-only".into(),
+                4,
+            ),
+        );
+        BlobIndex::save_journal(&store, &root, &blobs, &std::collections::HashMap::new()).unwrap();
+
+        let dry = prune_orphans(&c, &store, &CancelToken::new(), true).unwrap();
+        assert_eq!(dry.objects_deleted, 3);
+        assert!(store.head(&orphan_pack).unwrap().is_some());
+
+        let summary = prune_orphans(&c, &store, &CancelToken::new(), false).unwrap();
+        assert_eq!(summary.objects_deleted, 3);
+        assert!(store.head(&orphan_pack).unwrap().is_none());
+        assert!(store.head(&orphan_std).unwrap().is_none());
+        assert!(store.head(&orphan_tree).unwrap().is_none());
+        assert!(store.head(&live_pack).unwrap().is_some());
+        assert!(store.head(&indexed_only).unwrap().is_some());
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orphan_cleanup_keeps_record_paths_even_with_an_empty_index() {
+        let src = std::env::temp_dir().join(format!("orphan-rec-src-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("orphan-rec-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("keep.txt"), b"record references this").unwrap();
+
+        let store = LocalStore::new(&dir).unwrap();
+        let mut c = cfg();
+        c.source_path = src.to_string_lossy().to_string();
+        c.schedule_minutes = 0;
+        crate::core::engine::run_backup(&mut c, &store, CancelToken::new(), &mut |_| {}).unwrap();
+
+        let root = c.key_root();
+        let mut before = Vec::new();
+        for prefix in ORPHAN_GC_PREFIXES {
+            before.extend(
+                store
+                    .list(&record::root_key(&root, prefix))
+                    .unwrap()
+                    .into_iter()
+                    .map(|object| object.key),
+            );
+        }
+        assert!(!before.is_empty());
+
+        // Simulate a lost/incomplete index: the record alone must still protect
+        // every physical object it references.
+        BlobIndex::default().save(&store, &root, &c).unwrap();
+        let summary = prune_orphans(&c, &store, &CancelToken::new(), false).unwrap();
+        assert_eq!(
+            summary.objects_deleted, 0,
+            "record-referenced objects must never be deleted"
+        );
+        for key in before {
+            assert!(store.head(&key).unwrap().is_some(), "{key} was deleted");
+        }
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

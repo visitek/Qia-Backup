@@ -37,6 +37,7 @@ use crate::core::model::{
 use crate::core::partial::PartialTree;
 use crate::core::record;
 use crate::core::recover;
+use crate::core::retention;
 use crate::core::snapshot::{self, PreparedSource};
 use crate::core::store::BlobStore;
 use crate::core::upload::{MAX_UPLOAD_THREADS, UploadDone, UploadKind, UploadPool};
@@ -1600,16 +1601,28 @@ pub fn run_backup_with_partial(
             index = rebuilt;
         }
     }
-    // Mark the destination while a partial tree is live. The explorer checks
-    // this marker before trusting in-memory partial data; a bucket flush
-    // removes it, so stale local data is never presented as remote content.
-    let partial_marker = record::partial_run_key(&root);
-    if partial.is_some() {
-        if let Err(e) = store.put(&partial_marker, Utc::now().to_rfc3339().as_bytes()) {
+    // A marker left over from an earlier run means that run did not reach a
+    // completed record (crash, force-quit, cancellation, or record-write
+    // failure). The next success can safely collect objects that the earlier
+    // run uploaded but never journaled.
+    let previous_run_interrupted = match record::partial_run_exists(store, &root) {
+        Ok(exists) => exists,
+        Err(e) => {
             logging::warn(format!(
-                "could not write partial-run marker {partial_marker}: {e}; partial browsing may be unavailable"
+                "could not check for an interrupted-run marker: {e}; automatic orphan cleanup is skipped"
             ));
+            false
         }
+    };
+
+    // Mark the destination while a run is active. The explorer checks this
+    // marker before trusting in-memory partial data; a successful run removes
+    // it, so stale local data is never presented as remote content.
+    let partial_marker = record::partial_run_key(&root);
+    if let Err(e) = store.put(&partial_marker, Utc::now().to_rfc3339().as_bytes()) {
+        logging::warn(format!(
+            "could not write run marker {partial_marker}: {e}; interrupted-run recovery and partial browsing may be unavailable"
+        ));
     }
 
     let previous = {
@@ -1754,7 +1767,7 @@ pub fn run_backup_with_partial(
             }
         };
         engine.phase("uploading", "writing final pack and backup record");
-        let (stats, errors, _index, mut record_encryptor) = engine.finish()?;
+        let (stats, errors, index, mut record_encryptor) = engine.finish()?;
         let disk_identifier = snapshot::disk_identifier(Path::new(&local_path));
         let mut record = record::make_record(
             &plan,
@@ -1786,6 +1799,25 @@ pub fn run_backup_with_partial(
             logging::warn(format!(
                 "could not remove partial-run marker {partial_marker}: {e}"
             ));
+        }
+
+        // The just-saved index is already in memory. Reuse it to scan only the
+        // data prefixes for objects left behind by the interrupted run. A
+        // cleanup failure must never invalidate an otherwise complete backup.
+        if previous_run_interrupted {
+            (progress)(ProgressEvent::Phase {
+                name: "cleaning".into(),
+                detail: "removing objects left by the interrupted run".into(),
+            });
+            match retention::prune_orphans_with_index(config, store, &index, &cancel, false) {
+                Ok(cleanup) => logging::info(format!(
+                    "interrupted-run cleanup: scanned {} objects, deleted {} orphaned objects",
+                    cleanup.objects_scanned, cleanup.objects_deleted
+                )),
+                Err(e) => logging::warn(format!(
+                    "interrupted-run cleanup failed; the backup itself is complete: {e}"
+                )),
+            }
         }
 
         // The complete index was already persisted by `engine.finish()` after
@@ -1989,6 +2021,53 @@ mod tests {
         assert!(
             !record::partial_run_exists(&store, &cfg.key_root()).unwrap(),
             "a successful record removes the partial-run marker"
+        );
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&store_dir).ok();
+    }
+
+    #[test]
+    fn successful_run_cleans_orphans_left_by_an_interrupted_run() {
+        let src = std::env::temp_dir().join(format!("orphan-run-src-{}", uuid::Uuid::new_v4()));
+        let store_dir =
+            std::env::temp_dir().join(format!("orphan-run-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("keep.txt"), b"keep this data").unwrap();
+
+        let store = LocalStore::new(&store_dir).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.bucket = "b".into();
+        cfg.region = "r".into();
+        cfg.access_key_id = "a".into();
+        cfg.secret_access_key = "s".into();
+        cfg.source_kind = "path".into();
+        cfg.source_path = src.to_string_lossy().to_string();
+        cfg.schedule_minutes = 0;
+
+        let root = cfg.key_root();
+        store
+            .put(
+                &record::partial_run_key(&root),
+                b"previous run was interrupted",
+            )
+            .unwrap();
+        let orphan = format!(
+            "{}/blobpacks/orphan-{}.blobpack",
+            root,
+            uuid::Uuid::new_v4()
+        );
+        store.put(&orphan, b"orphan").unwrap();
+
+        run_backup(&mut cfg, &store, CancelToken::new(), &mut |_| {}).unwrap();
+
+        assert!(
+            store.head(&orphan).unwrap().is_none(),
+            "a successful run after an interruption should remove untracked objects"
+        );
+        assert!(
+            !record::partial_run_exists(&store, &root).unwrap(),
+            "the completed run should remove its marker"
         );
 
         std::fs::remove_dir_all(&src).ok();

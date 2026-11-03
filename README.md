@@ -214,6 +214,10 @@ qia-backupctl restore --record 'qia-backups/<uuid>/backupfolders/.../backuprecor
 qia-backupctl prune --dry-run
 qia-backupctl prune
 
+# Also remove objects that no index, journal, or record references
+qia-backupctl prune --orphans --dry-run
+qia-backupctl prune --orphans
+
 # Foreground scheduler (interval comes from config)
 qia-backupctl daemon
 ```
@@ -438,6 +442,11 @@ versions.
    containing only confirmed entries. At the end, flush the final pack, write
    the `.backuprecord`, write the compacted base index and clear the journals.
 8. **Retain** — optionally prune old records and unreferenced packs/objects.
+   A successful run that follows an interrupted run also scans `blobpacks/`,
+   `standardobjects/`, and `treepacks/` for objects absent from the index,
+   journals, and every record, and deletes them. The scan is paginated and
+   keeps one path per pack rather than every blob, so it stays bounded for a
+   2 TB source. Use `prune --orphans` for an explicit cleanup.
 
 Blob IDs are SHA-256 of plaintext, so compression/encryption do not break
 dedupe. Trees and blobs are all content-addressed; `blobpacks` are deleted only

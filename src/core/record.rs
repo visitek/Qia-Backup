@@ -33,9 +33,10 @@ pub fn backup_folder_key(root: &str, folder_uuid: &str) -> String {
     )
 }
 
-/// Marker for an in-progress/aborted partial run. It lets the explorer verify
-/// that local partial-tree data still corresponds to this S3 destination before
-/// showing or restoring it.
+/// Marker for an in-progress/aborted run. It lets the explorer verify that
+/// local partial-tree data still corresponds to this S3 destination before
+/// showing or restoring it, and a leftover marker tells the next successful
+/// backup that the previous run may have left unjournaled objects behind.
 pub fn partial_run_key(root: &str) -> String {
     root_key(root, "partialrun.json")
 }

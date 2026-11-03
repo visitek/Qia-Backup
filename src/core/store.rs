@@ -22,6 +22,14 @@ pub struct ObjectInfo {
     pub etag: Option<String>,
 }
 
+/// One page of a listing. `next` is the continuation token to pass to the next
+/// call, or `None` when the prefix has been exhausted.
+#[derive(Debug, Clone)]
+pub struct ObjectPage {
+    pub objects: Vec<ObjectInfo>,
+    pub next: Option<String>,
+}
+
 pub trait BlobStore: Send + Sync {
     fn put(&self, key: &str, data: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Vec<u8>>;
@@ -29,6 +37,29 @@ pub trait BlobStore: Send + Sync {
     fn head(&self, key: &str) -> Result<Option<ObjectInfo>>;
     fn delete(&self, key: &str) -> Result<()>;
     fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>>;
+
+    /// Return one page of objects under `prefix`. The default implementation is
+    /// for small/local stores; S3 overrides it so a multi-million-object backup
+    /// set can be scanned without holding the whole listing in memory.
+    fn list_page(
+        &self,
+        prefix: &str,
+        continuation: Option<&str>,
+        max_keys: u32,
+    ) -> Result<ObjectPage> {
+        let objects = self.list(prefix)?;
+        let start = continuation
+            .and_then(|token| token.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(objects.len());
+        let limit = max_keys.max(1) as usize;
+        let end = start.saturating_add(limit).min(objects.len());
+        let next = (end < objects.len()).then(|| end.to_string());
+        Ok(ObjectPage {
+            objects: objects[start..end].to_vec(),
+            next,
+        })
+    }
 
     /// Read `length` bytes starting at `offset`. The default implementation
     /// reads the whole object; S3 uses an HTTP Range request so packed blobs
@@ -562,11 +593,11 @@ impl S3Store {
     }
 
     pub fn test_connection(&self) -> Result<()> {
-        self.list_page("", None, 1)?;
+        self.fetch_page("", None, 1)?;
         Ok(())
     }
 
-    fn list_page(
+    fn fetch_page(
         &self,
         prefix: &str,
         continuation: Option<&str>,
@@ -606,6 +637,19 @@ impl S3Store {
 }
 
 impl BlobStore for S3Store {
+    fn list_page(
+        &self,
+        prefix: &str,
+        continuation: Option<&str>,
+        max_keys: u32,
+    ) -> Result<ObjectPage> {
+        let page = self.fetch_page(prefix, continuation, max_keys.clamp(1, 1000))?;
+        Ok(ObjectPage {
+            objects: page.objects,
+            next: page.next.filter(|token| !token.is_empty()),
+        })
+    }
+
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let response = self.execute("PUT", key, &[], Some(data), &[])?;
         if !(200..300).contains(&response.status) {
@@ -679,7 +723,7 @@ impl BlobStore for S3Store {
     }
 
     fn list_first(&self, prefix: &str) -> Result<Option<ObjectInfo>> {
-        let page = self.list_page(prefix, None, 1)?;
+        let page = self.fetch_page(prefix, None, 1)?;
         Ok(page.objects.into_iter().next())
     }
 
@@ -694,7 +738,7 @@ impl BlobStore for S3Store {
         let mut token: Option<String> = None;
         let mut deleted = 0usize;
         loop {
-            let page = self.list_page(prefix, token.as_deref(), 1000)?;
+            let page = self.fetch_page(prefix, token.as_deref(), 1000)?;
             const WORKERS: usize = 8;
             for batch in page.objects.chunks(WORKERS) {
                 let results: Vec<Result<()>> = std::thread::scope(|scope| {
@@ -752,7 +796,7 @@ impl BlobStore for S3Store {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let page = self.list_page(prefix, token.as_deref(), 1000)?;
+            let page = self.fetch_page(prefix, token.as_deref(), 1000)?;
             out.extend(page.objects);
             if !page.is_truncated {
                 break;
@@ -1057,6 +1101,32 @@ mod tests {
         assert!(store.list("a/").unwrap()[0].key.contains("a/b.txt"));
         store.delete("a/b.txt").unwrap();
         assert!(store.list("a/").unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_store_pages_listings_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("backup-page-test-{}", uuid::Uuid::new_v4()));
+        let store = LocalStore::new(&dir).unwrap();
+        for i in 0..5 {
+            store.put(&format!("pre/{i}.bin"), b"x").unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut token = None;
+        loop {
+            let page = store.list_page("pre/", token.as_deref(), 2).unwrap();
+            seen.extend(page.objects.into_iter().map(|object| object.key));
+            match page.next {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            (0..5).map(|i| format!("pre/{i}.bin")).collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

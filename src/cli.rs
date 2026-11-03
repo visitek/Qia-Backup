@@ -63,6 +63,10 @@ enum Commands {
     Prune {
         #[arg(long)]
         dry_run: bool,
+        /// Also remove objects that are absent from the index, journals, and
+        /// every backup record (for example uploads left by a crash).
+        #[arg(long)]
+        orphans: bool,
     },
     /// Delete all objects in this backup set (does not delete the bucket).
     DeleteSet {
@@ -265,7 +269,7 @@ fn run_inner(cli: Cli) -> Result<()> {
         Commands::Snapshots => cmd_snapshots(),
         Commands::Diff(args) => cmd_diff(args),
         Commands::Restore(args) => cmd_restore(args),
-        Commands::Prune { dry_run } => cmd_prune(dry_run),
+        Commands::Prune { dry_run, orphans } => cmd_prune(dry_run, orphans),
         Commands::DeleteSet { yes } => cmd_delete_set(yes),
         Commands::Daemon { interval } => cmd_daemon(interval),
         Commands::Info => cmd_info(),
@@ -661,13 +665,25 @@ fn cmd_restore(args: RestoreArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_prune(dry_run: bool) -> Result<()> {
+fn cmd_prune(dry_run: bool, orphans: bool) -> Result<()> {
     let config = load_ready()?;
     config::validate(&config)?;
     let store = store_for(&config)?;
-    let summary =
-        crate::core::retention::prune(&config, store.as_ref(), &CancelToken::new(), dry_run)?;
-    println!("{}", serde_json::to_string_pretty(&summary)?);
+    let cancel = CancelToken::new();
+    let summary = crate::core::retention::prune(&config, store.as_ref(), &cancel, dry_run)?;
+    if orphans {
+        let orphan_summary =
+            crate::core::retention::prune_orphans(&config, store.as_ref(), &cancel, dry_run)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "retention": summary,
+                "orphans": orphan_summary,
+            }))?
+        );
+    } else {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    }
     Ok(())
 }
 
