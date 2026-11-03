@@ -1,10 +1,14 @@
 //! Backup engine: walks a source tree, chunks files, deduplicates blobs,
 //! uploads packs, and writes backup records.
 //!
-//! Scale note: walking, chunking and hashing are currently sequential. For
-//! multi-million-file sources the next throughput win is a bounded parallel
-//! scan/chunk/hash pipeline. Sparse-file holes are also read as zeros today;
-//! using SEEK_HOLE/SEEK_DATA would cut both read and upload volume.
+//! Scale note: directory traversal is still sequential, but changed regular
+//! files are read, chunked, hashed, compressed and encrypted by a bounded scan
+//! worker pool. Worker concurrency is learned from measured per-worker scan
+//! throughput and capped by available CPUs. Files larger than
+//! `MAX_PARALLEL_FILE_BYTES` stay on the streaming walk-thread path so a single
+//! huge file cannot make worker memory unbounded. Sparse-file holes are still
+//! read as zeros today; using SEEK_HOLE/SEEK_DATA would cut both read and upload
+//! volume.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -13,8 +17,9 @@ use std::io::Read;
 use std::os::macos::fs::MetadataExt as MacMetadataExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -31,8 +36,8 @@ use crate::core::error::{BackupError, IoContext, Result};
 use crate::core::index::{BlobIndex, PackInfo};
 use crate::core::logging;
 use crate::core::model::{
-    ALWAYS_IGNORED_METADATA, AppConfig, BACKUP_FORMAT_VERSION, BackupConfig, BackupFolder,
-    BackupFolders, BackupRecordError, BlobLoc, NODE_TREE_VERSION, Node, Tree,
+    AppConfig, BackupConfig, BackupFolder, BackupFolders, BackupRecordError, BlobLoc, Node, Tree,
+    ALWAYS_IGNORED_METADATA, BACKUP_FORMAT_VERSION, NODE_TREE_VERSION,
 };
 use crate::core::partial::PartialTree;
 use crate::core::record;
@@ -40,7 +45,7 @@ use crate::core::recover;
 use crate::core::retention;
 use crate::core::snapshot::{self, PreparedSource};
 use crate::core::store::BlobStore;
-use crate::core::upload::{MAX_UPLOAD_THREADS, UploadDone, UploadKind, UploadPool};
+use crate::core::upload::{UploadDone, UploadKind, UploadPool, MAX_UPLOAD_THREADS};
 
 /// Blobs up to one pack's worth are appended to a blobpack; larger ones are
 /// uploaded standalone. Trees are packed too, which keeps S3 object counts low
@@ -60,6 +65,28 @@ const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// Compact journals into the base index after this many segments. This bounds
 /// startup work for a run that keeps getting interrupted.
 const JOURNAL_COMPACT_SEGMENTS: usize = 64;
+
+/// Hard cap on scan workers. The walk thread, upload workers and UI still need
+/// CPU, and each worker may hold one prepared file in memory.
+const MAX_SCAN_WORKERS: usize = 8;
+/// Files larger than this are streamed on the walk thread instead of being
+/// prepared whole in a worker. That keeps worker memory bounded even when a
+/// single file is hundreds of gigabytes.
+const MAX_PARALLEL_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound on estimated source bytes dispatched but not yet committed on
+/// the walk thread. Includes jobs queued in the worker pool.
+const SCAN_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+/// How often the scan controller may change its active worker target.
+const SCAN_SCALE_INTERVAL: Duration = Duration::from_secs(3);
+/// Time allowed after adding a worker before comparing per-worker throughput.
+const SCAN_PROBE_SETTLE: Duration = Duration::from_secs(6);
+/// Quiet period after a scan probe so the target does not oscillate.
+const SCAN_PROBE_COOLDOWN: Duration = Duration::from_secs(10);
+/// Keep a probe only if per-worker throughput stays within 15% of the
+/// pre-probe rate. A collapse means the device or CPU was already saturated.
+const SCAN_PROBE_RETENTION: f64 = 0.85;
+/// Only probe upward while scanned data keeps the active workers busy.
+const SCAN_UTILIZATION_MIN: f64 = 0.5;
 
 #[derive(Clone, Default)]
 pub struct CancelToken {
@@ -193,6 +220,418 @@ enum BlobClass {
     Tree,
 }
 
+/// A blob that has already been hashed, compressed and encrypted by a scan
+/// worker. The walk thread only has to deduplicate it and append it to a pack.
+#[derive(Debug)]
+struct PreparedBlob {
+    id: String,
+    stored: Vec<u8>,
+    plaintext_len: u64,
+    compression_type: u32,
+}
+
+#[derive(Debug)]
+struct FileScanJob {
+    id: u64,
+    path: PathBuf,
+    rel: String,
+}
+
+#[derive(Debug)]
+struct PreparedFile {
+    id: u64,
+    data: Vec<PreparedBlob>,
+    xattrs: Vec<PreparedBlob>,
+    bytes_read: u64,
+    scan_seconds: f64,
+}
+
+#[derive(Debug)]
+enum ScanOutcome {
+    Prepared(PreparedFile),
+    Failed {
+        id: u64,
+        rel: String,
+        path: PathBuf,
+        message: String,
+        cancelled: bool,
+    },
+}
+
+struct PendingScanFile {
+    rel: String,
+    name: String,
+    parent: String,
+    meta: fs::Metadata,
+    estimated: u64,
+}
+
+struct ScanProbe {
+    previous_target: usize,
+    baseline_per_worker_bps: u64,
+    started_at: Instant,
+}
+
+/// Adjusts the number of active scan workers from measured scan throughput.
+///
+/// It adds one worker at a time while there is queued work and the pool is
+/// busy, then keeps the extra worker only if per-worker throughput did not
+/// collapse. This learns the current device/CPU limit instead of assuming that
+/// more readers always help.
+struct ScanTuner {
+    max_workers: usize,
+    target_workers: usize,
+    window_started: Instant,
+    window_bytes: u64,
+    window_worker_seconds: f64,
+    next_scale: Instant,
+    cooldown_until: Instant,
+    probe: Option<ScanProbe>,
+}
+
+impl ScanTuner {
+    fn new(max_workers: usize, now: Instant) -> Self {
+        let max_workers = max_workers.max(1);
+        Self {
+            max_workers,
+            // Two readers are safe on any device and already overlap I/O with
+            // hashing. The controller ramps further only when throughput holds.
+            target_workers: max_workers.min(2),
+            window_started: now,
+            window_bytes: 0,
+            window_worker_seconds: 0.0,
+            next_scale: now + SCAN_SCALE_INTERVAL,
+            cooldown_until: now,
+            probe: None,
+        }
+    }
+
+    fn record(&mut self, bytes: u64, seconds: f64) {
+        self.window_bytes = self.window_bytes.saturating_add(bytes);
+        if seconds.is_finite() && seconds > 0.0 {
+            self.window_worker_seconds += seconds;
+        }
+    }
+
+    fn tick(&mut self, now: Instant, pending_jobs: usize, active_workers: usize) -> usize {
+        if now < self.next_scale {
+            return self.target_workers;
+        }
+        self.next_scale = now + SCAN_SCALE_INTERVAL;
+        let elapsed = now
+            .saturating_duration_since(self.window_started)
+            .as_secs_f64()
+            .max(0.001);
+        let per_worker_bps = if self.window_worker_seconds > 0.1 {
+            (self.window_bytes as f64 / self.window_worker_seconds) as u64
+        } else {
+            0
+        };
+        let target = self.target_workers.max(1) as f64;
+        let utilization = (self.window_worker_seconds / (target * elapsed)).clamp(0.0, 1.0);
+
+        if let Some(probe) = self.probe.take() {
+            if now.duration_since(probe.started_at) < SCAN_PROBE_SETTLE {
+                self.probe = Some(probe);
+            } else {
+                if per_worker_bps > 0
+                    && probe.baseline_per_worker_bps > 0
+                    && ((per_worker_bps as f64)
+                        < probe.baseline_per_worker_bps as f64 * SCAN_PROBE_RETENTION)
+                {
+                    // The extra readers shared a saturated device/CPU instead
+                    // of adding capacity. Return to the previous target.
+                    self.target_workers = probe.previous_target;
+                }
+                self.cooldown_until = now + SCAN_PROBE_COOLDOWN;
+            }
+        } else if self.target_workers < self.max_workers
+            && now >= self.cooldown_until
+            && pending_jobs > active_workers
+            && utilization >= SCAN_UTILIZATION_MIN
+            && per_worker_bps > 0
+        {
+            self.probe = Some(ScanProbe {
+                previous_target: self.target_workers,
+                baseline_per_worker_bps: per_worker_bps,
+                started_at: now,
+            });
+            self.target_workers += 1;
+        }
+
+        self.window_started = now;
+        self.window_bytes = 0;
+        self.window_worker_seconds = 0.0;
+        self.target_workers
+    }
+}
+
+/// Limits how many scan workers may read at once. All workers are spawned up
+/// front, so scaling never allocates threads on the hot path.
+struct ScanGate {
+    state: Mutex<(usize, usize)>,
+    changed: Condvar,
+}
+
+impl ScanGate {
+    fn new(target: usize) -> Self {
+        Self {
+            state: Mutex::new((target.max(1), 0)),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) {
+        let mut state = self.state.lock().expect("scan gate poisoned");
+        while state.1 >= state.0 {
+            state = self.changed.wait(state).expect("scan gate poisoned");
+        }
+        state.1 += 1;
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("scan gate poisoned");
+        state.1 = state.1.saturating_sub(1);
+        self.changed.notify_all();
+    }
+
+    fn set_target(&self, target: usize) {
+        let mut state = self.state.lock().expect("scan gate poisoned");
+        state.0 = target.max(1);
+        self.changed.notify_all();
+    }
+
+    fn active(&self) -> usize {
+        self.state.lock().expect("scan gate poisoned").1
+    }
+}
+
+struct ScanPipeline {
+    tx: Option<Sender<FileScanJob>>,
+    rx: Receiver<ScanOutcome>,
+    gate: Arc<ScanGate>,
+    tuner: ScanTuner,
+    reserved_bytes: u64,
+    next_id: u64,
+    pending: HashMap<u64, PendingScanFile>,
+    /// Finished files keyed by job id. `None` means the file failed; the walk
+    /// thread records the error when it collects the result.
+    completed: HashMap<u64, Option<Node>>,
+}
+
+impl ScanPipeline {
+    fn start<'scope, 'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        chunk_size: u64,
+        keys: Option<MasterKeys>,
+        cancel: CancelToken,
+    ) -> Self {
+        let max_workers = max_scan_workers();
+        let (tx, job_rx) = mpsc::channel::<FileScanJob>();
+        let (done_tx, rx) = mpsc::channel::<ScanOutcome>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let initial_workers = max_workers.min(2);
+        let gate = Arc::new(ScanGate::new(initial_workers));
+        for _ in 0..max_workers {
+            let job_rx = Arc::clone(&job_rx);
+            let done_tx = done_tx.clone();
+            let gate = Arc::clone(&gate);
+            let keys = keys.clone();
+            let cancel = cancel.clone();
+            scope.spawn(move || loop {
+                let job = {
+                    let receiver = job_rx.lock().expect("scan queue poisoned");
+                    receiver.recv()
+                };
+                let Ok(job) = job else { break };
+                gate.acquire();
+                let outcome = match prepare_file(&job, chunk_size, &keys, &cancel) {
+                    Ok(prepared) => ScanOutcome::Prepared(prepared),
+                    Err(BackupError::Cancelled) => ScanOutcome::Failed {
+                        id: job.id,
+                        rel: job.rel,
+                        path: job.path,
+                        message: "scan cancelled".into(),
+                        cancelled: true,
+                    },
+                    Err(e) => ScanOutcome::Failed {
+                        id: job.id,
+                        rel: job.rel,
+                        path: job.path,
+                        message: e.to_string(),
+                        cancelled: false,
+                    },
+                };
+                gate.release();
+                if done_tx.send(outcome).is_err() {
+                    break;
+                }
+                if cancel.is_cancelled() {
+                    break;
+                }
+            });
+        }
+        drop(done_tx);
+        let now = Instant::now();
+        Self {
+            tx: Some(tx),
+            rx,
+            gate,
+            tuner: ScanTuner::new(max_workers, now),
+            reserved_bytes: 0,
+            next_id: 0,
+            pending: HashMap::new(),
+            completed: HashMap::new(),
+        }
+    }
+
+    fn has_budget(&self, bytes: u64) -> bool {
+        self.pending.is_empty() || self.reserved_bytes.saturating_add(bytes) <= SCAN_INFLIGHT_BYTES
+    }
+
+    fn begin(&mut self, pending: PendingScanFile) -> Result<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(pending.estimated);
+        self.pending.insert(id, pending);
+        Ok(id)
+    }
+
+    fn send(&mut self, id: u64, path: PathBuf, rel: String) -> Result<()> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| BackupError::Other("scan pipeline is already closed".into()))?;
+        tx.send(FileScanJob { id, path, rel })
+            .map_err(|_| BackupError::Other("scan workers stopped unexpectedly".into()))
+    }
+
+    fn abandon(&mut self, id: u64) {
+        if let Some(pending) = self.pending.remove(&id) {
+            self.reserved_bytes = self.reserved_bytes.saturating_sub(pending.estimated);
+        }
+        self.completed.remove(&id);
+    }
+
+    fn take(&mut self, id: u64) -> Option<Option<Node>> {
+        self.completed.remove(&id)
+    }
+
+    fn active_workers(&self) -> usize {
+        self.gate.active()
+    }
+}
+
+fn max_scan_workers() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    // Keep one CPU for the walk/coordination thread and upload code. A blocked
+    // read still benefits from more than one worker on a single-core machine,
+    // so never drop below one.
+    cpus.saturating_sub(1).clamp(1, MAX_SCAN_WORKERS)
+}
+
+fn parent_rel(rel: &str) -> String {
+    match rel.rsplit_once('/') {
+        Some((parent, _)) => parent.to_string(),
+        None => String::new(),
+    }
+}
+
+fn collect_xattrs(path: &Path, symlink_target: Option<&Path>) -> Result<Option<Vec<u8>>> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    if let Ok(names) = xattr::list(path) {
+        for name in names {
+            let name = name.to_string_lossy().to_string();
+            if let Ok(Some(value)) = xattr::get(path, &name) {
+                map.insert(
+                    name,
+                    base64::engine::general_purpose::STANDARD.encode(value),
+                );
+            }
+        }
+    }
+    if let Some(target) = symlink_target {
+        map.insert(
+            "__backup_symlink_target".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(target.to_string_lossy().as_bytes()),
+        );
+    }
+    if map.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_vec(&map)?))
+}
+
+fn prepare_blob(plaintext: &[u8], encryptor: &mut Option<ObjectEncryptor>) -> Result<PreparedBlob> {
+    let id = sha256_hex(plaintext);
+    prepare_blob_with_id(plaintext, id, encryptor)
+}
+
+fn prepare_blob_with_id(
+    plaintext: &[u8],
+    id: String,
+    encryptor: &mut Option<ObjectEncryptor>,
+) -> Result<PreparedBlob> {
+    let compressed = compress_blob(plaintext);
+    let compression_type = compressed.compression_type;
+    let stored = match encryptor {
+        Some(enc) => enc.encrypt(&compressed.bytes)?,
+        None => compressed.bytes,
+    };
+    Ok(PreparedBlob {
+        id,
+        stored,
+        plaintext_len: plaintext.len() as u64,
+        compression_type,
+    })
+}
+
+fn prepare_file(
+    job: &FileScanJob,
+    chunk_size: u64,
+    keys: &Option<MasterKeys>,
+    cancel: &CancelToken,
+) -> Result<PreparedFile> {
+    let started = Instant::now();
+    let mut encryptor = keys.as_ref().map(|keys| ObjectEncryptor::new(keys.clone()));
+    let mut file = fs::File::open(&job.path).at(&job.path)?;
+    let mut chunker = Chunker::new(ChunkerConfig::for_target(chunk_size));
+    let mut data = Vec::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut bytes_read = 0u64;
+    loop {
+        cancel.check()?;
+        let n = file.read(&mut buf).at(&job.path)?;
+        if n == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(n as u64);
+        let slice = &buf[..n];
+        chunker.update(slice, |chunk| {
+            data.push(prepare_blob(chunk, &mut encryptor)?);
+            Ok(())
+        })?;
+    }
+    chunker.finish(|chunk| {
+        data.push(prepare_blob(chunk, &mut encryptor)?);
+        Ok(())
+    })?;
+
+    let mut xattrs = Vec::new();
+    if let Some(json) = collect_xattrs(&job.path, None)? {
+        xattrs.push(prepare_blob(&json, &mut encryptor)?);
+    }
+    Ok(PreparedFile {
+        id: job.id,
+        data,
+        xattrs,
+        bytes_read,
+        scan_seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncludeDecision {
     Skip,
@@ -295,6 +734,7 @@ pub struct BackupEngine<'a> {
     partial: Option<PartialTree>,
     last_transfer_emit: Instant,
     last_upload_target: usize,
+    scan: Option<ScanPipeline>,
 }
 
 impl<'a> BackupEngine<'a> {
@@ -340,10 +780,33 @@ impl<'a> BackupEngine<'a> {
             in_checkpoint: false,
             uploads,
             upload_error: None,
+            scan: None,
             partial,
             last_transfer_emit: Instant::now(),
             last_upload_target: 0,
         })
+    }
+
+    /// Start scan workers after `ensure_metadata` has created or loaded the
+    /// encryption keys. Workers encrypt as they read, so they must see the same
+    /// key state as the walk thread.
+    fn start_scan<'scope, 'env>(
+        &mut self,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        cancel: CancelToken,
+    ) {
+        self.scan = Some(ScanPipeline::start(
+            scope,
+            self.config.chunk_size,
+            self.keys.clone(),
+            cancel,
+        ));
+    }
+
+    fn scan_mut(&mut self) -> Result<&mut ScanPipeline> {
+        self.scan
+            .as_mut()
+            .ok_or_else(|| BackupError::Other("scan pipeline is not running".into()))
     }
 
     fn phase(&mut self, name: &str, detail: impl Into<String>) {
@@ -514,15 +977,34 @@ impl<'a> BackupEngine<'a> {
             self.stats.blobs_reused += 1;
             return Ok(loc.clone());
         }
+        let prepared = prepare_blob_with_id(plaintext, id, &mut self.encryptor)?;
+        self.commit_prepared_blob(prepared, class)
+    }
 
-        let compressed = compress_blob(plaintext);
-        let compression_type = compressed.compression_type;
+    /// Add a blob prepared by a scan worker to the index and a pack. The walk
+    /// thread remains the only mutator of index/pack/upload state, so a worker
+    /// can prepare CPU-heavy work without holding a lock on the engine.
+    fn commit_prepared_blob(
+        &mut self,
+        prepared: PreparedBlob,
+        class: BlobClass,
+    ) -> Result<BlobLoc> {
+        self.cancel.check()?;
+        if let Some(e) = &self.upload_error {
+            return Err(BackupError::Store(e.clone()));
+        }
+        let PreparedBlob {
+            id,
+            stored,
+            compression_type,
+            ..
+        } = prepared;
+        if let Some(loc) = self.index.blob(&id) {
+            self.stats.blobs_reused += 1;
+            return Ok(loc.clone());
+        }
+
         let encrypted = self.encryptor.is_some();
-        let stored = match self.encryptor.as_mut() {
-            Some(enc) => enc.encrypt(&compressed.bytes)?,
-            None => compressed.bytes,
-        };
-
         let stored_len = stored.len();
         // Cache the stored bytes now so the next incremental run can read
         // unchanged trees locally instead of issuing one S3 GET per directory.
@@ -891,6 +1373,17 @@ impl<'a> BackupEngine<'a> {
         if self.bytes_since_checkpoint >= CHECKPOINT_BYTES
             || self.last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL
         {
+            // A checkpoint is only useful if it covers confirmed uploads. When
+            // fast scanning outruns the upload pool, wait for one transfer so
+            // this durability point is not an empty journal write.
+            if self.pending_blobs.is_empty()
+                && self.pending_packs.is_empty()
+                && self.uploads.in_flight() > 0
+            {
+                if let Some(done) = self.uploads.wait_one() {
+                    self.handle_upload_done(done);
+                }
+            }
             self.checkpoint_index()?;
         }
         Ok(())
@@ -973,45 +1466,174 @@ impl<'a> BackupEngine<'a> {
             && prev.mac_st_mode == meta.mode()
     }
 
-    fn collect_xattrs(
-        &mut self,
-        path: &Path,
-        symlink_target: Option<&Path>,
-    ) -> Result<Option<Vec<u8>>> {
-        let mut map: BTreeMap<String, String> = BTreeMap::new();
-        if let Ok(names) = xattr::list(path) {
-            for name in names {
-                let name = name.to_string_lossy().to_string();
-                if let Ok(Some(value)) = xattr::get(path, &name) {
-                    map.insert(
-                        name,
-                        base64::engine::general_purpose::STANDARD.encode(value),
-                    );
-                }
-            }
-        }
-        if let Some(target) = symlink_target {
-            map.insert(
-                "__backup_symlink_target".to_string(),
-                base64::engine::general_purpose::STANDARD
-                    .encode(target.to_string_lossy().as_bytes()),
-            );
-        }
-        if map.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(serde_json::to_vec(&map)?))
-    }
-
     fn attach_xattrs(&mut self, node: &mut Node, path: &Path, symlink: bool) -> Result<()> {
         let target = if symlink {
             std::fs::read_link(path).ok()
         } else {
             None
         };
-        if let Some(json) = self.collect_xattrs(path, target.as_deref())? {
+        if let Some(json) = collect_xattrs(path, target.as_deref())? {
             let loc = self.store_blob(&json, BlobClass::Data)?;
             node.xattrs_blob_locs.push(loc);
+        }
+        Ok(())
+    }
+
+    fn dispatch_scan_file(
+        &mut self,
+        abs: &Path,
+        rel: &str,
+        name: &str,
+        meta: &fs::Metadata,
+    ) -> Result<u64> {
+        let estimated = meta.size().max(1);
+        loop {
+            if self
+                .scan
+                .as_ref()
+                .is_some_and(|scan| scan.has_budget(estimated))
+            {
+                break;
+            }
+            if !self.pump_scan_results()? {
+                std::thread::yield_now();
+            }
+        }
+        let pending = PendingScanFile {
+            rel: rel.to_string(),
+            name: name.to_string(),
+            parent: parent_rel(rel),
+            meta: meta.clone(),
+            estimated,
+        };
+        let scan = self.scan_mut()?;
+        let id = scan.begin(pending)?;
+        if let Err(e) = scan.send(id, abs.to_path_buf(), rel.to_string()) {
+            scan.abandon(id);
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    fn pump_scan_results(&mut self) -> Result<bool> {
+        let mut any = false;
+        loop {
+            let outcome = {
+                let scan = self.scan_mut()?;
+                match scan.rx.try_recv() {
+                    Ok(outcome) => Some(outcome),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(BackupError::Other(
+                            "scan workers stopped unexpectedly".into(),
+                        ));
+                    }
+                }
+            };
+            let Some(outcome) = outcome else { break };
+            any = true;
+            self.finish_scan_outcome(outcome)?;
+        }
+        self.tick_scan_tuner()?;
+        Ok(any)
+    }
+
+    fn tick_scan_tuner(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let scan = self.scan_mut()?;
+        let pending = scan.pending.len();
+        let active = scan.active_workers();
+        let target = scan.tuner.tick(now, pending, active);
+        scan.gate.set_target(target);
+        Ok(())
+    }
+
+    fn finish_scan_outcome(&mut self, outcome: ScanOutcome) -> Result<()> {
+        match outcome {
+            ScanOutcome::Prepared(prepared) => {
+                let Some(pending) = self.scan_mut()?.pending.remove(&prepared.id) else {
+                    return Ok(());
+                };
+                {
+                    let scan = self.scan_mut()?;
+                    scan.reserved_bytes = scan.reserved_bytes.saturating_sub(pending.estimated);
+                    scan.tuner
+                        .record(prepared.bytes_read, prepared.scan_seconds);
+                }
+                let mut node = self.node_from_metadata(&pending.meta, &pending.rel);
+                for blob in prepared.data {
+                    let len = blob.plaintext_len;
+                    node.data_blob_locs
+                        .push(self.commit_prepared_blob(blob, BlobClass::Data)?);
+                    self.stats.bytes_scanned = self.stats.bytes_scanned.saturating_add(len);
+                    self.bytes_since_checkpoint = self.bytes_since_checkpoint.saturating_add(len);
+                    // Checkpoint between committed chunks so a large prepared
+                    // file still journals confirmed uploads mid-file.
+                    self.maybe_checkpoint()?;
+                }
+                for blob in prepared.xattrs {
+                    node.xattrs_blob_locs
+                        .push(self.commit_prepared_blob(blob, BlobClass::Data)?);
+                }
+                if pending.meta.nlink() > 1 {
+                    self.hardlinks.insert(
+                        (pending.meta.dev(), pending.meta.ino()),
+                        node.data_blob_locs.clone(),
+                    );
+                }
+                self.publish_partial_child(&pending.parent, &pending.name, &node);
+                (self.progress)(ProgressEvent::File {
+                    files: self.stats.files,
+                    bytes_scanned: self.stats.bytes_scanned,
+                });
+                self.maybe_checkpoint()?;
+                self.scan_mut()?.completed.insert(prepared.id, Some(node));
+            }
+            ScanOutcome::Failed {
+                id,
+                rel,
+                path,
+                message,
+                cancelled,
+            } => {
+                {
+                    let scan = self.scan_mut()?;
+                    if let Some(pending) = scan.pending.remove(&id) {
+                        scan.reserved_bytes = scan.reserved_bytes.saturating_sub(pending.estimated);
+                    }
+                    scan.completed.insert(id, None);
+                }
+                if cancelled || self.cancel.is_cancelled() {
+                    return Err(BackupError::Cancelled);
+                }
+                self.add_error(&path, &rel, 3, message, 3);
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait until every job from this directory has produced a node or an
+    /// error. Results for other directories are kept in `completed`.
+    fn wait_scan_files(&mut self, ids: &[u64]) -> Result<()> {
+        let mut remaining: HashSet<u64> = ids.iter().copied().collect();
+        while !remaining.is_empty() {
+            {
+                let scan = self.scan_mut()?;
+                remaining.retain(|id| !scan.completed.contains_key(id));
+            }
+            if remaining.is_empty() {
+                break;
+            }
+            let outcome = self.scan_mut()?.rx.recv();
+            match outcome {
+                Ok(outcome) => self.finish_scan_outcome(outcome)?,
+                Err(_) => {
+                    return Err(BackupError::Other(
+                        "scan workers stopped unexpectedly".into(),
+                    ));
+                }
+            }
+            self.tick_scan_tuner()?;
         }
         Ok(())
     }
@@ -1172,6 +1794,7 @@ impl<'a> BackupEngine<'a> {
 
         let mut children: Vec<(String, Node)> = Vec::new();
         let mut contained_files = 0u64;
+        let mut scan_jobs: Vec<(u64, String)> = Vec::new();
         for (name, path) in entries {
             self.cancel.check()?;
             let child_rel = if rel.is_empty() {
@@ -1217,15 +1840,31 @@ impl<'a> BackupEngine<'a> {
                 }
             } else if meta.is_file() {
                 self.stats.files += 1;
-                match self.backup_file(&path, &child_rel, &meta, prev_child) {
-                    Ok(node) => {
-                        contained_files += 1;
-                        self.publish_partial_child(rel, &name, &node);
-                        children.push((name, node));
+                let unchanged = prev_child.is_some_and(|prev| Self::unchanged(prev, &meta));
+                let hardlinked =
+                    meta.nlink() > 1 && self.hardlinks.contains_key(&(meta.dev(), meta.ino()));
+                if !unchanged
+                    && !hardlinked
+                    && self.scan.is_some()
+                    && meta.size() <= MAX_PARALLEL_FILE_BYTES
+                {
+                    match self.dispatch_scan_file(&path, &child_rel, &name, &meta) {
+                        Ok(id) => scan_jobs.push((id, name)),
+                        Err(BackupError::Cancelled) => return Err(BackupError::Cancelled),
+                        Err(e @ BackupError::Store(_)) => return Err(e),
+                        Err(e) => self.add_error(&path, &child_rel, 3, e.to_string(), 3),
                     }
-                    Err(BackupError::Cancelled) => return Err(BackupError::Cancelled),
-                    Err(e @ BackupError::Store(_)) => return Err(e),
-                    Err(e) => self.add_error(&path, &child_rel, 3, e.to_string(), 3),
+                } else {
+                    match self.backup_file(&path, &child_rel, &meta, prev_child) {
+                        Ok(node) => {
+                            contained_files += 1;
+                            self.publish_partial_child(rel, &name, &node);
+                            children.push((name, node));
+                        }
+                        Err(BackupError::Cancelled) => return Err(BackupError::Cancelled),
+                        Err(e @ BackupError::Store(_)) => return Err(e),
+                        Err(e) => self.add_error(&path, &child_rel, 3, e.to_string(), 3),
+                    }
                 }
             } else if meta.file_type().is_symlink() {
                 match self.backup_symlink(&path, &child_rel, &meta, prev_child) {
@@ -1242,6 +1881,15 @@ impl<'a> BackupEngine<'a> {
                 // entries so a restore can recreate the node type.
                 let node = self.node_from_metadata(&meta, &child_rel);
                 self.publish_partial_child(rel, &name, &node);
+                children.push((name, node));
+            }
+        }
+
+        let scan_ids: Vec<u64> = scan_jobs.iter().map(|(id, _)| *id).collect();
+        self.wait_scan_files(&scan_ids)?;
+        for (id, name) in scan_jobs {
+            if let Some(Some(node)) = self.scan_mut()?.take(id) {
+                contained_files += 1;
                 children.push((name, node));
             }
         }
@@ -1752,6 +2400,7 @@ pub fn run_backup_with_partial(
             progress,
         )?;
         engine.ensure_metadata()?;
+        engine.start_scan(scope, cancel.clone());
         engine.phase("scanning", walk_root.to_string_lossy());
         let root_meta = fs::symlink_metadata(&walk_root).at(&walk_root)?;
         engine.source_dev = root_meta.dev();
@@ -1898,11 +2547,9 @@ mod tests {
         .unwrap();
         assert!(summary.files >= 2);
         assert!(summary.bytes_uploaded > 0);
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, ProgressEvent::Finished { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::Finished { .. })));
         assert!(
             events.iter().any(|e| matches!(
                 e,
@@ -2135,6 +2782,117 @@ mod tests {
 
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&store_dir).ok();
+    }
+
+    fn scan_window(tuner: &mut ScanTuner, target: usize, seconds: f64, per_worker_mbps: u64) {
+        let bytes = (seconds * target as f64 * per_worker_mbps as f64) as u64;
+        tuner.record(bytes, seconds * target as f64);
+    }
+
+    #[test]
+    fn parallel_scan_roundtrips_many_files() {
+        use crate::core::restore::restore_latest;
+
+        let src = std::env::temp_dir().join(format!("parallel-src-{}", uuid::Uuid::new_v4()));
+        let dst = std::env::temp_dir().join(format!("parallel-store-{}", uuid::Uuid::new_v4()));
+        let restored = std::env::temp_dir().join(format!("parallel-dst-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(src.join("a")).unwrap();
+        std::fs::create_dir_all(src.join("b")).unwrap();
+        for index in 0..48u8 {
+            let dir = if index % 2 == 0 { "a" } else { "b" };
+            let path = src.join(dir).join(format!("file-{index:02}.bin"));
+            let data = vec![index; 2_000 + index as usize * 137];
+            std::fs::write(path, data).unwrap();
+        }
+        std::fs::write(src.join("empty.txt"), b"").unwrap();
+
+        let store = LocalStore::new(&dst).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.bucket = "test".into();
+        cfg.region = "us-east-1".into();
+        cfg.access_key_id = "test".into();
+        cfg.secret_access_key = "test".into();
+        cfg.source_kind = "path".into();
+        cfg.source_path = src.to_string_lossy().to_string();
+        cfg.schedule_minutes = 0;
+        cfg.chunk_size = 16 * 1024;
+
+        let summary = run_backup(&mut cfg, &store, CancelToken::new(), &mut |_| {}).unwrap();
+        assert_eq!(summary.files, 49);
+        assert_eq!(summary.errors, 0);
+
+        restore_latest(&cfg, &store, &restored, CancelToken::new(), &mut |_| {}).unwrap();
+        for index in 0..48u8 {
+            let dir = if index % 2 == 0 { "a" } else { "b" };
+            let path = restored.join(dir).join(format!("file-{index:02}.bin"));
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                vec![index; 2_000 + index as usize * 137]
+            );
+        }
+        assert_eq!(std::fs::read(restored.join("empty.txt")).unwrap(), b"");
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
+        std::fs::remove_dir_all(&restored).ok();
+    }
+
+    #[test]
+    fn scan_tuner_probes_up_and_keeps_a_real_gain() {
+        let t0 = Instant::now();
+        let mut tuner = ScanTuner::new(4, t0);
+        scan_window(&mut tuner, 2, 3.0, 100);
+        let t1 = t0 + SCAN_SCALE_INTERVAL + Duration::from_millis(1);
+        assert_eq!(tuner.tick(t1, 4, 2), 3);
+
+        scan_window(&mut tuner, 3, 6.0, 100);
+        let t2 = t1 + SCAN_PROBE_SETTLE + Duration::from_millis(1);
+        assert_eq!(
+            tuner.tick(t2, 4, 3),
+            3,
+            "per-worker throughput held, so the extra worker stays"
+        );
+    }
+
+    #[test]
+    fn scan_tuner_reverts_when_per_worker_throughput_collapses() {
+        let t0 = Instant::now();
+        let mut tuner = ScanTuner::new(4, t0);
+        scan_window(&mut tuner, 2, 3.0, 100);
+        let t1 = t0 + SCAN_SCALE_INTERVAL + Duration::from_millis(1);
+        assert_eq!(tuner.tick(t1, 4, 2), 3);
+
+        scan_window(&mut tuner, 3, 6.0, 50);
+        let t2 = t1 + SCAN_PROBE_SETTLE + Duration::from_millis(1);
+        assert_eq!(
+            tuner.tick(t2, 4, 3),
+            2,
+            "a collapsed per-worker rate means the device was saturated"
+        );
+    }
+
+    #[test]
+    fn scan_tuner_does_not_add_workers_to_an_idle_pool() {
+        let t0 = Instant::now();
+        let mut tuner = ScanTuner::new(4, t0);
+        tuner.record(10 * 1024 * 1024, 0.1);
+        let t1 = t0 + SCAN_SCALE_INTERVAL + Duration::from_millis(1);
+        assert_eq!(
+            tuner.tick(t1, 0, 2),
+            2,
+            "the walker, not the device, is the bottleneck"
+        );
+    }
+
+    #[test]
+    fn scan_tuner_never_exceeds_the_safe_worker_cap() {
+        let t0 = Instant::now();
+        let mut tuner = ScanTuner::new(1, t0);
+        scan_window(&mut tuner, 1, 3.0, 100);
+        let t1 = t0 + SCAN_SCALE_INTERVAL + Duration::from_millis(1);
+        assert_eq!(tuner.tick(t1, 10, 1), 1);
+        let workers = max_scan_workers();
+        assert!((1..=MAX_SCAN_WORKERS).contains(&workers));
     }
 }
 
@@ -2690,12 +3448,10 @@ mod more_tests {
         let mut cfg = test_config(&src, true);
         let summary = run_backup(&mut cfg, &store, CancelToken::new(), &mut |_| {}).unwrap();
         assert!(summary.bytes_uploaded > 0);
-        assert!(
-            store
-                .get_opt(&format!("{}/encryptedkeyset.dat", cfg.key_root()))
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get_opt(&format!("{}/encryptedkeyset.dat", cfg.key_root()))
+            .unwrap()
+            .is_some());
         let rec = restore_latest(&cfg, &store, &dst, CancelToken::new(), &mut |_| {}).unwrap();
         assert_eq!(rec.files, 2);
         assert_eq!(
@@ -3115,10 +3871,9 @@ mod include_tests {
         let mut cfg = AppConfig::default();
         cfg.source_kind = "snapshot".into();
         let err = crate::core::config::validate_backup_selection(&cfg).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("select at least one included folder")
-        );
+        assert!(err
+            .to_string()
+            .contains("select at least one included folder"));
         cfg.included_folders = vec!["Users".into()];
         assert!(crate::core::config::validate_backup_selection(&cfg).is_ok());
     }

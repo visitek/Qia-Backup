@@ -37,6 +37,12 @@ Time Machine drive is required.** The engine is Rust; the desktop UI is Tauri
   scan. The pool starts conservatively and grows up to 16 concurrent PUTs as
   measured throughput increases (four workers around 5 MB/s, matching four
   64 MiB packs in roughly a minute). In-flight upload memory is bounded.
+- Changed regular files are read, chunked, hashed, compressed and encrypted by
+  a bounded scan worker pool while the walk continues. The pool starts with at
+  most two workers, learns the device's per-worker scan throughput, and grows
+  up to 8 workers without exceeding available CPU or a bounded in-flight byte
+  budget. Files larger than 64 MiB stay on the streaming walk-thread path so
+  worker memory stays bounded.
 - Stores data in content-addressed containers: `blobpacks/`, `treepacks/`,
   `standardobjects/`, JSON configuration files, and LZ4-compressed
   `.backuprecord` files under `backupfolders/<uuid>/backuprecords/`.
@@ -535,6 +541,10 @@ written by other tools.
   upload. Packs default to 64 MiB, so a slow uplink can still cap throughput.
   In-flight upload memory is bounded by the configured pack size and worker
   count.
+- The directory walk itself is still single-threaded. Incremental runs visit
+  every directory and stat every file to detect changes, although unchanged
+  file contents are not read. A first backup also performs one extra metadata
+  pass to estimate totals for the progress bar.
 - No WORM/Object Lock and no S3 lifecycle management.
 - Credentials and the encryption password are stored in the macOS Keychain;
   `config.json` contains only non-secret settings. Keep a separate copy of the
