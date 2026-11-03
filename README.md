@@ -115,7 +115,7 @@ Outputs:
 
 ```
 src-tauri/target/release/bundle/macos/Qia Backup.app
-src-tauri/target/release/bundle/dmg/Qia Backup_0.1.0_*.dmg
+src-tauri/target/release/bundle/dmg/Qia Backup_0.2.0_*.dmg
 ```
 
 The app is signed only if you configure a signing identity in Tauri; unsigned
@@ -315,11 +315,14 @@ independent of the Mac, and keep a copy of the config if possible.
    encryption password.
 3. **Save settings**.
 4. **Dashboard** → **Back Up Now**. Progress, files, bytes read/uploaded,
-   upload speed, active upload workers and activity are live. The Dashboard
-   also shows an estimated monthly S3 cost based on the bytes currently stored
-   under this backup set. Backups pause on battery power or while the Mac
-   sleeps and resume after five minutes of stable power; **Don't resume**
-   cancels a power-paused run.
+   upload speed, active upload workers and activity are live. Uploads are
+   capped at **3 MB/s** by default; change the maximum in **Settings → Upload**
+   and use the **Limit** toggle on the Dashboard to enable or disable it. Both
+   changes apply immediately, including to a backup that is already running.
+   The Dashboard also shows an estimated monthly S3 cost based on the bytes
+   currently stored under this backup set. Backups pause on battery power or
+   while the Mac sleeps and resume after five minutes of stable power;
+   **Don't resume** cancels a power-paused run.
 5. **Backups** lists completed records and offers **Changes** (added, modified
    and deleted files vs. the previous record), restore, prune and delete-set.
    Restore, Ignore, Remove, Restore entire backup, Cancel backup, Delete backup
@@ -346,9 +349,9 @@ independent of the Mac, and keep a copy of the config if possible.
 Closing the window hides Qia Backup to the macOS menu bar instead of quitting,
 so scheduled backups continue. The tray menu offers **Open Qia Backup**,
 **Cancel backup** (or **Cancel restore**) while an operation is running,
-**Pause automatic backups** / **Resume automatic backups**, and **Quit Qia
-Backup**. The tray title shows the current backup percentage while a run is
-active.
+**Pause automatic backups** / **Resume automatic backups**, the upload-limit
+toggle, and **Quit Qia Backup**. The tray title shows the current backup
+percentage while a run is active.
 
 Settings are stored at:
 

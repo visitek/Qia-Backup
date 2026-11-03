@@ -13,6 +13,8 @@ const DEFAULT_INCLUDED_FOLDERS = [
   "opt",
   "usr/local",
 ];
+const DEFAULT_UPLOAD_LIMIT_BPS = 3 * 1024 * 1024;
+const MIN_UPLOAD_LIMIT_BPS = 256 * 1024;
 const DEFAULT_EXCLUDE_PATTERNS = [
   "**/Library/Caches",
   "**/Library/Logs",
@@ -43,7 +45,7 @@ const state = {
   hasSecretAccessKey: false,
   hasEncryptionPassword: false,
   destinationCheck: null,
-  version: "0.1.0",
+  version: "0.2.0",
   lastRunning: false,
   diff: null,
   diffRecord: null,
@@ -88,7 +90,7 @@ const views = {
   dashboard: ["Dashboard", "Your Time Machine snapshots, safely in AWS S3."],
   backups: ["Backups", "Completed records — compare changes or restore any point in time."],
   files: ["Files", "Browse backed-up files and restore a file, folder, or whole backup."],
-  settings: ["Settings", "Destination, source, schedule and encryption."],
+  settings: ["Settings", "Destination, source, schedule, upload limit and encryption."],
   activity: ["Activity", "Agent log and diagnostics."],
 };
 
@@ -109,6 +111,16 @@ function fmtBytes(n) {
 
 function fmtSpeed(n) {
   return `${fmtBytes(n)}/s`;
+}
+
+function limitMbValue(bps) {
+  const mb = Math.max(MIN_UPLOAD_LIMIT_BPS, Number(bps) || DEFAULT_UPLOAD_LIMIT_BPS) / (1024 * 1024);
+  return Number.isInteger(mb) ? String(mb) : mb.toFixed(2);
+}
+
+function limitBpsFromInput() {
+  const mb = Math.max(MIN_UPLOAD_LIMIT_BPS / (1024 * 1024), num("upload-limit") || 3);
+  return Math.round(mb * 1024 * 1024);
 }
 
 function backupProgress(s) {
@@ -355,6 +367,7 @@ function applyConfig(cfg) {
   $("included-folders").value = (cfg.includedFolders || []).join("\n");
   $("excludes").value = (cfg.excludePatterns || []).join("\n");
   $("schedule").value = cfg.scheduleMinutes ?? 60;
+  $("upload-limit").value = limitMbValue(cfg.uploadLimitBytesPerSec);
   $("retain-all").checked = !!cfg.retainAll;
   $("retain-hours").value = cfg.retainHours ?? 24;
   $("retain-days").value = cfg.retainDays ?? 30;
@@ -396,6 +409,7 @@ function gatherConfig() {
     includedFolders: textareaLines("included-folders"),
     excludePatterns: textareaLines("excludes"),
     scheduleMinutes: Math.max(0, Math.round(num("schedule"))),
+    uploadLimitBytesPerSec: limitBpsFromInput(),
     retainAll: checked("retain-all"),
     retainHours: Math.max(0, Math.round(num("retain-hours"))),
     retainDays: Math.max(0, Math.round(num("retain-days"))),
@@ -437,6 +451,18 @@ function updateDashboard() {
     : "Not configured — open Settings";
   $("dash-source").textContent = `APFS snapshot of ${cfg.snapshotVolume || "/System/Volumes/Data"}`;
   $("dash-schedule").textContent = fmtSchedule(cfg.scheduleMinutes);
+  const limitEnabled = state.status?.uploadLimitEnabled ?? cfg.uploadLimitEnabled ?? true;
+  const limitBps = state.status?.uploadLimitBytesPerSec
+    || cfg.uploadLimitBytesPerSec
+    || DEFAULT_UPLOAD_LIMIT_BPS;
+  const limitToggle = $("upload-limit-toggle");
+  limitToggle.setAttribute("aria-pressed", String(!!limitEnabled));
+  $("dash-upload-limit").textContent = limitEnabled
+    ? `Limit ${fmtSpeed(limitBps)}`
+    : "Upload limit off";
+  limitToggle.title = limitEnabled
+    ? `Uploads are capped at ${fmtSpeed(limitBps)}. Click to remove the cap.`
+    : `Upload limit is off (${fmtSpeed(limitBps)} configured). Click to enable it.`;
   const last = state.status?.lastSummary || null;
   const backingUp = !!state.status?.running && !state.status?.restoring;
   const live = backingUp ? state.status : null;
@@ -749,9 +775,11 @@ function backupRow(entry, withRecord = false) {
     <td>${statusPill(entry)}</td>
     ${withRecord ? `<td class="mono">${record}</td>` : ""}
     <td>
-      <button class="link-button" data-diff="${esc(entry.key)}">Changes</button>
-      <button class="link-button" data-files-browse="${esc(entry.key)}">Browse</button>
-      <button class="link-button" data-restore="${esc(entry.key)}" title="Open the Files view to choose a destination and restore">Restore…</button>
+      <span class="row-actions">
+        <button class="link-button" data-diff="${esc(entry.key)}">Changes</button>
+        <button class="link-button" data-files-browse="${esc(entry.key)}">Browse</button>
+        <button class="link-button" data-restore="${esc(entry.key)}" title="Open the Files view to choose a destination and restore">Restore…</button>
+      </span>
     </td>
   </tr>`;
 }
@@ -1970,6 +1998,41 @@ function bind() {
       toast(paused ? "Automatic backups paused" : "Automatic backups enabled");
     } catch (e) { toast(String(e), true); }
   });
+  $("upload-limit-toggle").addEventListener("click", async () => {
+    const next = !(state.status?.uploadLimitEnabled ?? state.config?.uploadLimitEnabled ?? true);
+    if (demo) {
+      state.status = { ...state.status, uploadLimitEnabled: next };
+      if (state.config) state.config.uploadLimitEnabled = next;
+      updateDashboard();
+      toast(next ? "Upload limit enabled" : "Upload limit disabled");
+      return;
+    }
+    try {
+      const enabled = await invoke("set_upload_limit_enabled", { enabled: next });
+      state.status = { ...state.status, uploadLimitEnabled: enabled };
+      if (state.config) state.config.uploadLimitEnabled = enabled;
+      updateDashboard();
+      toast(enabled ? "Upload limit enabled" : "Upload limit disabled");
+    } catch (e) { toast(String(e), true); }
+  });
+  $("upload-limit").addEventListener("change", async () => {
+    const bps = limitBpsFromInput();
+    $("upload-limit").value = limitMbValue(bps);
+    if (demo) {
+      state.status = { ...state.status, uploadLimitBytesPerSec: bps };
+      if (state.config) state.config.uploadLimitBytesPerSec = bps;
+      updateDashboard();
+      toast(`Upload limit set to ${fmtSpeed(bps)}`);
+      return;
+    }
+    try {
+      await invoke("apply_upload_limit", { bytesPerSec: bps });
+      state.status = { ...state.status, uploadLimitBytesPerSec: bps };
+      if (state.config) state.config.uploadLimitBytesPerSec = bps;
+      updateDashboard();
+      toast(`Upload limit set to ${fmtSpeed(bps)} — save Settings to keep it`);
+    } catch (e) { toast(String(e), true); }
+  });
   $("new-backup-set").addEventListener("click", () => {
     const uuid = globalThis.crypto?.randomUUID?.() ||
       `new-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
@@ -2270,6 +2333,8 @@ function demoConfig() {
     encryptionPassword: "",
     packSizeBytes: 67108864,
     chunkSize: 1048576,
+    uploadLimitEnabled: true,
+    uploadLimitBytesPerSec: DEFAULT_UPLOAD_LIMIT_BPS,
     lastBackupAt: new Date(Date.now() - 6 * 3600 * 1000).toISOString(),
   };
 }
@@ -2289,6 +2354,8 @@ function demoStatus() {
       finishedAt: new Date(Date.now() - 6 * 3600 * 1000).toISOString(),
     },
     schedulerPaused: true,
+    uploadLimitEnabled: true,
+    uploadLimitBytesPerSec: DEFAULT_UPLOAD_LIMIT_BPS,
   };
 }
 function demoLogs() {

@@ -223,6 +223,13 @@ pub fn validate(config: &AppConfig) -> Result<()> {
     if config.pack_size_bytes < 1024 * 1024 {
         return Err(BackupError::Config("pack size is too small".into()));
     }
+    if config.upload_limit_enabled
+        && config.upload_limit_bytes_per_sec < crate::core::throttle::MIN_UPLOAD_LIMIT_BPS
+    {
+        return Err(BackupError::Config(
+            "upload limit must be at least 0.25 MB/s (or disable the limit)".into(),
+        ));
+    }
     // Validate path syntax now so a bad include cannot be saved and only
     // discovered hours later when a backup starts.
     normalize_included_folders(&config.included_folders)?;

@@ -54,6 +54,12 @@ pub struct AppStatus {
     /// Uploads currently handed to the worker pool and not yet completed.
     #[serde(default)]
     pub upload_in_flight: u32,
+    /// Whether the configured upload rate limit is active.
+    #[serde(default)]
+    pub upload_limit_enabled: bool,
+    /// Configured maximum upload throughput in bytes per second.
+    #[serde(default)]
+    pub upload_limit_bytes_per_sec: u64,
     /// A backup was paused because the Mac slept or switched to battery. It
     /// will resume automatically after stable power returns.
     #[serde(default)]

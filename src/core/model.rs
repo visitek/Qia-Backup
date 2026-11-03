@@ -460,6 +460,12 @@ pub struct AppConfig {
     pub pack_size_bytes: u64,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: u64,
+    /// Whether the upload rate limit is active.
+    #[serde(default = "default_upload_limit_enabled")]
+    pub upload_limit_enabled: bool,
+    /// Maximum upload throughput in bytes per second. Defaults to 3 MiB/s.
+    #[serde(default = "default_upload_limit_bps")]
+    pub upload_limit_bytes_per_sec: u64,
     #[serde(default)]
     pub last_backup_at: Option<DateTime<Utc>>,
 }
@@ -490,6 +496,11 @@ impl std::fmt::Debug for AppConfig {
             .field("encryption_password", &redacted(&self.encryption_password))
             .field("pack_size_bytes", &self.pack_size_bytes)
             .field("chunk_size", &self.chunk_size)
+            .field("upload_limit_enabled", &self.upload_limit_enabled)
+            .field(
+                "upload_limit_bytes_per_sec",
+                &self.upload_limit_bytes_per_sec,
+            )
             .field("last_backup_at", &self.last_backup_at)
             .finish()
     }
@@ -525,6 +536,12 @@ fn default_pack_size() -> u64 {
 }
 fn default_chunk_size() -> u64 {
     1024 * 1024
+}
+fn default_upload_limit_enabled() -> bool {
+    true
+}
+fn default_upload_limit_bps() -> u64 {
+    crate::core::throttle::DEFAULT_UPLOAD_LIMIT_BPS
 }
 
 /// Recommended folders for a practical Mac data backup. These are the initial
@@ -680,6 +697,8 @@ impl Default for AppConfig {
             encryption_password: String::new(),
             pack_size_bytes: default_pack_size(),
             chunk_size: default_chunk_size(),
+            upload_limit_enabled: default_upload_limit_enabled(),
+            upload_limit_bytes_per_sec: default_upload_limit_bps(),
             last_backup_at: None,
         }
     }
@@ -688,6 +707,27 @@ impl Default for AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_limit_defaults_to_three_mb_per_second() {
+        let cfg = AppConfig::default();
+        assert!(cfg.upload_limit_enabled);
+        assert_eq!(cfg.upload_limit_bytes_per_sec, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn older_configs_get_upload_limit_defaults() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("uploadLimitEnabled");
+        object.remove("uploadLimitBytesPerSec");
+        let cfg: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(cfg.upload_limit_enabled);
+        assert_eq!(
+            cfg.upload_limit_bytes_per_sec,
+            crate::core::throttle::DEFAULT_UPLOAD_LIMIT_BPS
+        );
+    }
 
     #[test]
     fn debug_redacts_secrets() {

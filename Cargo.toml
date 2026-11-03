@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "qia-backup"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Qia Backup: Time Machine / APFS snapshot backup to AWS S3"
 license = "MIT"

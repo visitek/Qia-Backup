@@ -32,30 +32,30 @@
       </div>
 
       <nav class="nav" aria-label="Sections">
-        <button class="nav-item active" data-view="dashboard">
+        <button class="nav-item active" data-view="dashboard" aria-label="Dashboard">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-5H4v5Zm10 0h6V11h-6v9Zm0-16v5h6V4h-6Z"/></svg>
           <span>Dashboard</span>
         </button>
-        <button class="nav-item" data-view="backups">
+        <button class="nav-item" data-view="backups" aria-label="Backups">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3C6.5 3 2 6 2 9.5S6.5 16 12 16s10-3 10-6.5S17.5 3 12 3Zm0 11c-4.4 0-8-2-8-4.5S7.6 5 12 5s8 2 8 4.5S16.4 14 12 14Zm0 3c-4.4 0-8-2-8-4.5H2C2 16 6.5 19 12 19s10-3 10-6.5h-2c0 2.5-3.6 4.5-8 4.5Z"/></svg>
           <span>Backups</span>
         </button>
-        <button class="nav-item" data-view="files">
+        <button class="nav-item" data-view="files" aria-label="Files">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6Zm2 0v12h14V8h-7.6l-2-2H5Z"/></svg>
           <span>Files</span>
         </button>
-        <button class="nav-item" data-view="settings">
+        <button class="nav-item" data-view="settings" aria-label="Settings">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.4 13a7.7 7.7 0 0 0 .1-1 7.7 7.7 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1L15 3h-4l-.3 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.7 7.7 0 0 0-.1 1c0 .3 0 .7.1 1l-2 1.6 2 3.4 2.4-1c.5.4 1.1.7 1.7 1L11 21h4l.3-2.6c.6-.3 1.2-.6 1.7-1l2.4 1 2-3.4-2-1.6ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg>
           <span>Settings</span>
         </button>
-        <button class="nav-item" data-view="activity">
+        <button class="nav-item" data-view="activity" aria-label="Activity">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v2H4V5Zm0 6h16v2H4v-2Zm0 6h10v2H4v-2Z"/></svg>
           <span>Activity</span>
         </button>
       </nav>
 
       <div class="sidebar-footer">
-        <div class="version" id="version">v0.1.0</div>
+        <div class="version" id="version">v0.2.0</div>
         <button class="link-button" id="open-config">Open config folder</button>
       </div>
     </aside>
@@ -79,20 +79,26 @@
       <!-- Dashboard -->
       <section class="view active" id="view-dashboard">
         <div class="hero card">
-          <div class="hero-main">
+          <div class="hero-destination-block">
             <div class="eyebrow">Destination</div>
             <div class="hero-destination" id="dash-destination">Not configured</div>
+          </div>
+          <div class="hero-footer">
             <div class="hero-meta">
               <div><span class="label">Source</span><span id="dash-source">—</span></div>
               <div><span class="label">Schedule</span><span id="dash-schedule">—</span></div>
               <div><span class="label">Last backup</span><span id="dash-last">Never</span></div>
               <div><span class="label">Incremental</span><span id="dash-incremental">—</span></div>
             </div>
-          </div>
-          <div class="hero-actions">
-            <button class="button" id="toggle-auto" title="Automatic backups start paused when the app launches">Auto: Paused</button>
-            <button class="button primary" id="backup-now">Back Up Now</button>
-            <button class="button danger hidden" id="cancel-run">Cancel</button>
+            <div class="hero-actions">
+              <button class="button" id="toggle-auto" title="Automatic backups start paused when the app launches">Auto: Paused</button>
+              <button class="button upload-limit-toggle" id="upload-limit-toggle" type="button" aria-pressed="true" title="Cap S3 upload speed to keep network capacity free. Changes apply immediately.">
+                <span class="limit-dot" aria-hidden="true"></span>
+                <span id="dash-upload-limit">Limit 3 MB/s</span>
+              </button>
+              <button class="button primary" id="backup-now">Back Up Now</button>
+              <button class="button danger hidden" id="cancel-run">Cancel</button>
+            </div>
           </div>
         </div>
 
@@ -366,6 +372,15 @@ Users/you/Projects"></textarea>
               <label for="schedule">Backup interval (minutes, 0 = manual)</label>
               <input id="schedule" type="number" min="0" step="5" />
               <span class="hint">How often a new backup starts. 60 means hourly.</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Upload</h3><span class="chip">Network</span></div>
+            <div class="field">
+              <label for="upload-limit">Maximum upload speed (MB/s)</label>
+              <input id="upload-limit" type="number" min="0.25" step="0.25" value="3" />
+              <span class="hint">Default 3 MB/s. Use the Dashboard toggle to enable or disable the limit. Changes apply immediately, even during a backup.</span>
             </div>
           </div>
 

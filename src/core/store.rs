@@ -1,8 +1,9 @@
 //! Object storage: a small trait, a local filesystem implementation for tests,
 //! and an AWS S3 implementation with SigV4 signing.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
@@ -10,7 +11,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::core::crypto::{hmac_sha256, sha256_hex};
+use crate::core::engine::CancelToken;
 use crate::core::error::{BackupError, IoContext, Result};
+use crate::core::throttle::{ThrottledReader, UploadLimiter};
 
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
@@ -239,6 +242,13 @@ pub struct S3Store {
     /// the server's clock from the error response and retry, so a Mac whose
     /// clock has drifted can still back up without manual intervention.
     clock_offset_secs: AtomicI64,
+    /// Optional shared upload throttle applied while the request body streams.
+    throttle: Option<UploadThrottle>,
+}
+
+struct UploadThrottle {
+    limiter: Arc<UploadLimiter>,
+    cancel: CancelToken,
 }
 
 #[derive(Debug, Clone)]
@@ -275,7 +285,20 @@ impl S3Store {
             config,
             client,
             clock_offset_secs: AtomicI64::new(0),
+            throttle: None,
         })
+    }
+
+    /// Attach a shared, dynamically adjustable upload limiter. The limiter is
+    /// consulted as the PUT body is read, so changing it affects in-flight
+    /// requests rather than only the next job.
+    pub fn with_upload_throttle(
+        mut self,
+        limiter: Arc<UploadLimiter>,
+        cancel: CancelToken,
+    ) -> Self {
+        self.throttle = Some(UploadThrottle { limiter, cancel });
+        self
     }
 
     pub fn config(&self) -> &S3Config {
@@ -428,6 +451,13 @@ impl S3Store {
         // scheduler retries the backup later.
         const MAX_ATTEMPTS: usize = 6;
         for attempt in 0..MAX_ATTEMPTS {
+            if self
+                .throttle
+                .as_ref()
+                .is_some_and(|throttle| throttle.cancel.is_cancelled())
+            {
+                return Err(BackupError::Cancelled);
+            }
             // Sign every attempt: retries must use a fresh `x-amz-date`, and a
             // clock correction learned from a previous response has to be
             // applied to the next signature.
@@ -437,7 +467,19 @@ impl S3Store {
                 req = req.header(k, v);
             }
             if let Some(body) = body {
-                req = req.body(body.to_vec());
+                if let Some(throttle) = &self.throttle {
+                    let reader = ThrottledReader::new(
+                        Cursor::new(body.to_vec()),
+                        throttle.limiter.clone(),
+                        throttle.cancel.clone(),
+                    );
+                    req = req.body(reqwest::blocking::Body::sized(
+                        reader,
+                        body.len() as u64,
+                    ));
+                } else {
+                    req = req.body(body.to_vec());
+                }
             }
             match req.send() {
                 Ok(response) => {
@@ -834,6 +876,20 @@ pub fn uri_encode(input: &str, encode_slash: bool) -> String {
 
 pub fn new_store(config: &crate::core::model::AppConfig) -> Result<Box<dyn BlobStore>> {
     Ok(Box::new(S3Store::new(S3Config::from_app(config))?))
+}
+
+/// Build an S3 store whose PUT bodies are limited by a shared, live-updatable
+/// upload throttle. Backups use this so Settings/Dashboard changes apply to the
+/// current run; read-only commands can keep using [`new_store`].
+pub fn new_store_with_upload_throttle(
+    config: &crate::core::model::AppConfig,
+    limiter: Arc<UploadLimiter>,
+    cancel: CancelToken,
+) -> Result<Box<dyn BlobStore>> {
+    Ok(Box::new(
+        S3Store::new(S3Config::from_app(config))?
+            .with_upload_throttle(limiter, cancel),
+    ))
 }
 
 /// Verify an object list looks like a backup set root (used by tests/debug UI).

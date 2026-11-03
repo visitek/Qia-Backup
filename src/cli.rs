@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -18,7 +19,8 @@ use crate::core::restore::{self, RestoreEvent};
 use crate::core::scheduler;
 use crate::core::secrets;
 use crate::core::snapshot;
-use crate::core::store::{BlobStore, new_store};
+use crate::core::store::{BlobStore, new_store_with_upload_throttle};
+use crate::core::throttle::UploadLimiter;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -240,7 +242,11 @@ fn load_ready() -> Result<AppConfig> {
 }
 
 fn store_for(config: &AppConfig) -> Result<Box<dyn BlobStore>> {
-    new_store(config)
+    let limiter = Arc::new(UploadLimiter::new(
+        config.upload_limit_enabled,
+        config.upload_limit_bytes_per_sec,
+    ));
+    new_store_with_upload_throttle(config, limiter, CancelToken::new())
 }
 
 fn run_inner(cli: Cli) -> Result<()> {

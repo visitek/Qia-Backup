@@ -8,7 +8,7 @@
   --border-strong: rgba(148, 176, 210, 0.28);
   --text: #e9f0fa;
   --text-dim: #a6b7cc;
-  --text-faint: #70839a;
+  --text-faint: #7b8fa8;
   --accent: #4cc4e8;
   --accent-2: #6f8bff;
   --accent-soft: rgba(76, 196, 232, 0.14);
@@ -26,22 +26,33 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+html { background: var(--bg); }
 body {
   margin: 0;
   font-family: var(--font);
   color: var(--text);
-  background:
-    radial-gradient(900px 600px at 8% -10%, rgba(61, 123, 255, 0.14), transparent 60%),
-    radial-gradient(800px 500px at 95% 0%, rgba(76, 196, 232, 0.09), transparent 55%),
-    var(--bg);
+  background: var(--bg);
   -webkit-font-smoothing: antialiased;
   font-size: 14px;
   line-height: 1.45;
 }
+/* Paint the ambient glow in its own viewport-fixed layer. `background-
+   attachment: fixed` is unreliable inside some WebViews; a fixed positioned
+   layer keeps the gradient completely still while the content scrolls. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(900px 600px at 8% -10%, rgba(61, 123, 255, 0.14), transparent 60%),
+    radial-gradient(800px 500px at 95% 0%, rgba(76, 196, 232, 0.09), transparent 55%);
+}
 
 ::selection { background: rgba(76, 196, 232, 0.3); }
 
-.app { display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; }
+.app { position: relative; z-index: 1; display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; }
 
 /* Sidebar */
 .sidebar {
@@ -151,17 +162,24 @@ body {
 .hint { color: var(--text-faint); font-weight: 400; font-size: 11px; }
 
 /* Hero */
-.hero { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 24px; }
-.hero-main { min-width: 0; }
+.hero { display: flex; flex-direction: column; align-items: stretch; gap: 18px; padding: 24px; }
+.hero-destination-block { min-width: 0; }
 .eyebrow { font-size: 10.5px; text-transform: uppercase; letter-spacing: .12em; color: var(--text-faint); margin-bottom: 7px; }
 .hero-destination {
   font-family: var(--mono); font-size: 17px; color: #dff8ff; font-weight: 500;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  line-height: 1.4; overflow-wrap: anywhere;
 }
-.hero-meta { display: flex; gap: 28px; margin-top: 16px; flex-wrap: wrap; }
+.hero-footer {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap;
+}
+.hero-meta { display: flex; gap: 28px; flex-wrap: wrap; }
 .hero-meta > div { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--text); }
 .hero-meta .label { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
-.hero-actions { display: flex; gap: 10px; flex-shrink: 0; }
+.hero-actions {
+  display: flex; gap: 10px; flex-shrink: 0; flex-wrap: wrap; align-items: center;
+  justify-content: flex-end; margin-left: auto; max-width: 100%;
+}
 
 /* Buttons */
 .button {
@@ -183,6 +201,19 @@ body {
 .button.danger { background: var(--red-soft); border-color: rgba(255, 107, 122, 0.4); color: #ffd7dc; }
 .button.danger-ghost { color: #ffbdc5; border-color: rgba(255, 107, 122, 0.25); background: transparent; }
 .button.danger-ghost:hover { background: var(--red-soft); }
+
+.upload-limit-toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--text-dim); }
+.upload-limit-toggle .limit-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint);
+  transition: background .15s ease, box-shadow .15s ease;
+}
+.upload-limit-toggle[aria-pressed="true"] {
+  color: var(--text); border-color: rgba(76, 196, 232, 0.35);
+  background: var(--accent-soft);
+}
+.upload-limit-toggle[aria-pressed="true"] .limit-dot {
+  background: var(--accent); box-shadow: 0 0 0 4px rgba(76, 196, 232, 0.12);
+}
 
 /* Progress */
 .progress-card { margin-top: 16px; }
@@ -212,6 +243,8 @@ body {
   text-align: left; font-weight: 500; color: var(--text-faint); font-size: 10.5px;
   text-transform: uppercase; letter-spacing: .06em; padding: 8px 10px; white-space: nowrap;
 }
+.row-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.row-actions .link-button { display: inline-flex; align-items: center; min-height: 24px; }
 .table td { padding: 10px; border-top: 1px solid var(--border); vertical-align: middle; }
 .table tbody tr:hover { background: rgba(148, 176, 210, 0.04); }
 .table .mono { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
@@ -236,7 +269,7 @@ body {
 .log-line .lvl { color: var(--text-faint); }
 .log-line.warn { color: #ffe2a1; }
 .log-line.error { color: #ffb7c0; }
-.log-line .ts { color: #5f7189; }
+.log-line .ts { color: var(--text-faint); }
 
 /* Forms */
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; }
@@ -360,7 +393,6 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
   .sidebar-footer { border: 0; }
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
   .grid-two { grid-template-columns: 1fr; }
-  .hero { flex-direction: column; align-items: flex-start; }
   .main { padding: 22px 20px 48px; }
 }
 @media (max-width: 680px) {

@@ -27,6 +27,7 @@ pub mod secrets;
 pub mod snapshot;
 pub mod status;
 pub mod store;
+pub mod throttle;
 pub mod upload;
 pub mod versions;
 

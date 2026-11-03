@@ -33,7 +33,8 @@ use qia_backup::core::scheduler;
 use qia_backup::core::secrets;
 use qia_backup::core::snapshot;
 use qia_backup::core::status::{AppStatus, TransferMeter};
-use qia_backup::core::store::new_store;
+use qia_backup::core::store::{new_store, new_store_with_upload_throttle};
+use qia_backup::core::throttle::{MIN_UPLOAD_LIMIT_BPS, UploadLimiter};
 use qia_backup::core::versions;
 
 pub type SharedState = Arc<AppInner>;
@@ -50,6 +51,8 @@ pub struct AppInner {
     sensitive_auth: Mutex<Option<SensitiveGrant>>,
     /// Recent upload completions, used to display a rolling transfer speed.
     transfer_meter: Arc<Mutex<TransferMeter>>,
+    /// Shared, live-updatable limit applied to S3 PUT bodies.
+    upload_limiter: Arc<UploadLimiter>,
     /// Sleep/battery policy and the macOS observers that feed it.
     power: crate::power::PowerMonitor,
     /// Set before cancelling a run because power conditions changed. The
@@ -77,6 +80,7 @@ struct TrayState {
     progress: MenuItem<Wry>,
     cancel: MenuItem<Wry>,
     auto: MenuItem<Wry>,
+    upload_limit: MenuItem<Wry>,
     _menu: Menu<Wry>,
 }
 
@@ -171,6 +175,7 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
         let progress_item = state.progress.clone();
         let cancel_item = state.cancel.clone();
         let auto_item = state.auto.clone();
+        let upload_limit_item = state.upload_limit.clone();
         drop(state);
 
         let mut last_title: Option<String> = None;
@@ -179,6 +184,7 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
         let mut last_cancel_label = String::new();
         let mut last_cancel_enabled: Option<bool> = None;
         let mut last_auto_label = String::new();
+        let mut last_upload_limit_label = String::new();
         loop {
             let status = status.lock().clone();
             let (title, tooltip, progress) = tray_status(&status);
@@ -195,6 +201,15 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
             } else {
                 "Pause automatic backups".to_string()
             };
+            let upload_limit_label = format!(
+                "{} upload limit ({}/s)",
+                if status.upload_limit_enabled {
+                    "Disable"
+                } else {
+                    "Enable"
+                },
+                human_bytes(status.upload_limit_bytes_per_sec)
+            );
 
             if title != last_title {
                 let _ = tray.set_title(title.as_deref());
@@ -219,6 +234,10 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
             if auto_label != last_auto_label {
                 let _ = auto_item.set_text(auto_label.as_str());
                 last_auto_label = auto_label;
+            }
+            if upload_limit_label != last_upload_limit_label {
+                let _ = upload_limit_item.set_text(upload_limit_label.as_str());
+                last_upload_limit_label = upload_limit_label;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -312,12 +331,15 @@ fn get_state(state: State<'_, SharedState>) -> Bootstrap {
 #[tauri::command]
 fn get_status(state: State<'_, SharedState>) -> StatusResponse {
     let speed = state.transfer_meter.lock().snapshot();
+    let (limit_enabled, limit_bps) = state.upload_limiter.settings();
     let mut status = state.status.lock().clone();
     status.upload_speed_bps = if status.running && !status.restoring {
         speed
     } else {
         0
     };
+    status.upload_limit_enabled = limit_enabled;
+    status.upload_limit_bytes_per_sec = limit_bps;
     StatusResponse {
         status,
         logs: logging::tail(200),
@@ -344,8 +366,17 @@ fn save_config(state: State<'_, SharedState>, mut config: AppConfig) -> Result<A
     secrets::store_changed(&previous, &config).map_err(err)?;
     config::save(&config).map_err(err)?;
     *state.config.lock() = config.clone();
-    // A previous error may have been about the settings that just changed.
-    state.status.lock().last_error = None;
+    state.upload_limiter.set(
+        config.upload_limit_enabled,
+        config.upload_limit_bytes_per_sec,
+    );
+    {
+        let mut status = state.status.lock();
+        status.upload_limit_enabled = config.upload_limit_enabled;
+        status.upload_limit_bytes_per_sec = config.upload_limit_bytes_per_sec;
+        // A previous error may have been about the settings that just changed.
+        status.last_error = None;
+    }
     logging::info("configuration saved");
     Ok(config)
 }
@@ -631,7 +662,11 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
         let transfer_meter = inner.transfer_meter.clone();
         let app_progress = app.clone();
         let mut last_emit = Instant::now();
-        let result = match new_store(&cfg) {
+        let result = match new_store_with_upload_throttle(
+            &cfg,
+            inner.upload_limiter.clone(),
+            cancel.clone(),
+        ) {
             Ok(store) => match preflight::check(&cfg, store.as_ref()) {
                 Ok(check) if !check.can_backup => Err(BackupError::Config(check.message)),
                 Ok(_) => run_backup_with_partial(
@@ -924,6 +959,51 @@ fn set_scheduler_paused_inner(inner: &AppInner, paused: bool) -> bool {
 #[tauri::command]
 fn set_scheduler_paused(state: State<'_, SharedState>, paused: bool) -> bool {
     set_scheduler_paused_inner(state.inner().as_ref(), paused)
+}
+
+fn set_upload_limit_enabled_inner(inner: &AppInner, enabled: bool) -> Result<bool, String> {
+    let mut config = inner.config.lock().clone();
+    config.upload_limit_enabled = enabled;
+    if config.upload_limit_bytes_per_sec < MIN_UPLOAD_LIMIT_BPS {
+        config.upload_limit_bytes_per_sec = MIN_UPLOAD_LIMIT_BPS;
+    }
+    config::save(&config).map_err(err)?;
+    *inner.config.lock() = config.clone();
+    inner.upload_limiter.set(
+        config.upload_limit_enabled,
+        config.upload_limit_bytes_per_sec,
+    );
+    {
+        let mut status = inner.status.lock();
+        status.upload_limit_enabled = config.upload_limit_enabled;
+        status.upload_limit_bytes_per_sec = config.upload_limit_bytes_per_sec;
+    }
+    logging::info(if enabled {
+        "upload limit enabled"
+    } else {
+        "upload limit disabled"
+    });
+    Ok(enabled)
+}
+
+#[tauri::command]
+fn set_upload_limit_enabled(state: State<'_, SharedState>, enabled: bool) -> Result<bool, String> {
+    set_upload_limit_enabled_inner(state.inner().as_ref(), enabled)
+}
+
+#[tauri::command]
+fn apply_upload_limit(state: State<'_, SharedState>, bytes_per_sec: u64) -> Result<(), String> {
+    if bytes_per_sec < MIN_UPLOAD_LIMIT_BPS {
+        return Err("upload limit must be at least 0.25 MB/s".into());
+    }
+    // Keep the current on/off state. The Dashboard toggle owns that choice, so
+    // a live rate edit cannot race with an enable/disable click.
+    let (enabled, _) = state.upload_limiter.settings();
+    state.upload_limiter.set(enabled, bytes_per_sec);
+    let mut status = state.status.lock();
+    status.upload_limit_enabled = enabled;
+    status.upload_limit_bytes_per_sec = bytes_per_sec;
+    Ok(())
 }
 
 fn request_cancel(inner: &AppInner) -> Result<(), String> {
@@ -1537,13 +1617,21 @@ pub fn run() {
         config.included_folders = qia_backup::core::model::default_included_folders();
         config.exclude_patterns = qia_backup::core::model::default_exclude_patterns();
     }
+    let upload_limiter = Arc::new(UploadLimiter::new(
+        config.upload_limit_enabled,
+        config.upload_limit_bytes_per_sec,
+    ));
+    let mut initial_status = AppStatus::paused();
+    initial_status.upload_limit_enabled = config.upload_limit_enabled;
+    initial_status.upload_limit_bytes_per_sec = config.upload_limit_bytes_per_sec;
     let shared: SharedState = Arc::new(AppInner {
         config: Mutex::new(config),
-        status: Arc::new(Mutex::new(AppStatus::paused())),
+        status: Arc::new(Mutex::new(initial_status)),
         cancel: Mutex::new(CancelToken::new()),
         partial_tree: PartialTree::new(),
         sensitive_auth: Mutex::new(None),
         transfer_meter: Arc::new(Mutex::new(TransferMeter::new())),
+        upload_limiter,
         power: crate::power::PowerMonitor::start(),
         power_pause_requested: AtomicBool::new(false),
     });
@@ -1558,6 +1646,8 @@ pub fn run() {
             test_connection,
             check_destination,
             set_scheduler_paused,
+            set_upload_limit_enabled,
+            apply_upload_limit,
             authorize_sensitive_action,
             clear_sensitive_authorization,
             start_backup,
@@ -1616,6 +1706,13 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let upload_limit_item = MenuItem::with_id(
+                app.handle(),
+                "tray_toggle_upload_limit",
+                "Upload limit",
+                true,
+                None::<&str>,
+            )?;
             let separator_top = PredefinedMenuItem::separator(app.handle())?;
             let separator_bottom = PredefinedMenuItem::separator(app.handle())?;
             let quit_item = MenuItem::with_id(
@@ -1633,6 +1730,7 @@ pub fn run() {
                     &separator_top,
                     &cancel_item,
                     &auto_item,
+                    &upload_limit_item,
                     &separator_bottom,
                     &quit_item,
                 ],
@@ -1660,6 +1758,18 @@ pub fn run() {
                             set_scheduler_paused_inner(inner.inner().as_ref(), !paused);
                         }
                     }
+                    "tray_toggle_upload_limit" => {
+                        if let Some(inner) = app.try_state::<SharedState>() {
+                            let enabled = inner.status.lock().upload_limit_enabled;
+                            if let Err(e) =
+                                set_upload_limit_enabled_inner(inner.inner().as_ref(), !enabled)
+                            {
+                                logging::debug(format!(
+                                    "tray could not toggle the upload limit: {e}"
+                                ));
+                            }
+                        }
+                    }
                     "tray_quit" => app.exit(0),
                     _ => {}
                 })
@@ -1669,6 +1779,7 @@ pub fn run() {
                 progress: progress_item,
                 cancel: cancel_item,
                 auto: auto_item,
+                upload_limit: upload_limit_item,
                 _menu: tray_menu,
             });
             let status = app.state::<SharedState>().status.clone();

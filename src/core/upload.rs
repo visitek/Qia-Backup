@@ -268,7 +268,7 @@ impl UploadPool {
                         budget: Arc::clone(&budget),
                         bytes,
                     };
-                    let result = if cancel.is_cancelled() {
+                    let mut result = if cancel.is_cancelled() {
                         Err(BackupError::Cancelled)
                     } else {
                         // A panic in a store implementation must not take down
@@ -285,6 +285,11 @@ impl UploadPool {
                             )))
                         })
                     };
+                    if cancel.is_cancelled() {
+                        // A throttled body can be interrupted mid-request and
+                        // surface as an I/O error; report the user's intent.
+                        result = Err(BackupError::Cancelled);
+                    }
                     gate.release();
 
                     let done = UploadDone {
