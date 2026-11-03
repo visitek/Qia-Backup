@@ -561,6 +561,35 @@ pub const DEFAULT_INCLUDED_FOLDERS: &[&str] = &[
 pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     "**/Library/Caches",
     "**/Library/Logs",
+    // Log files and common rotations (`x.log`, `x.log.1`, `x.log1`,
+    // `x.log.gz`). These do not match names like `x.logo` or `x.logbook`.
+    "**/*.log",
+    "**/*.log.*",
+    "**/*.log[0-9]*",
+    // LLM model weights are large and re-downloadable. Hugging Face, PyTorch,
+    // Whisper and most tool caches already live under `~/.cache` or
+    // `~/Library/Caches`, which are excluded below. These cover the tools that
+    // keep models outside a cache directory, plus common weight formats.
+    "**/.ollama/models",
+    "**/.lmstudio/models",
+    "**/.keras/models",
+    "**/.docker/models",
+    "**/Library/Application Support/LM Studio/models",
+    "**/Library/Application Support/Jan/data/models",
+    "**/*.gguf",
+    "**/*.ggml",
+    "**/*.safetensors",
+    "**/*.onnx",
+    "**/*.ckpt",
+    "**/*.keras",
+    "**/*.mlmodel",
+    "**/*.mlmodelc",
+    "**/*.mlpackage",
+    "**/*.tflite",
+    "**/*.nemo",
+    "**/*.caffemodel",
+    "**/*.pdparams",
+    "**/*.weights",
     "**/Library/Saved Application State",
     "**/Library/Application Support/CrashReporter",
     "**/.cache",
@@ -575,6 +604,18 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     "**/private/var/folders",
     "**/private/var/tmp",
     "**/private/tmp",
+    // Cloud-storage placeholders can force downloads while walking; OS update
+    // downloads and developer/toolchain caches are all re-obtainable.
+    "**/Library/CloudStorage",
+    "**/Library/Updates",
+    "**/go/pkg/mod",
+    "**/.gradle/caches",
+    "**/.m2/repository",
+    "**/.rustup/toolchains",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/.mypy_cache",
+    "**/.ruff_cache",
 ];
 
 /// macOS filesystem metadata that is never useful in a backup. These are
