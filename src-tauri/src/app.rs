@@ -32,7 +32,7 @@ use qia_backup::core::retention;
 use qia_backup::core::scheduler;
 use qia_backup::core::secrets;
 use qia_backup::core::snapshot;
-use qia_backup::core::status::{AppStatus, TransferMeter};
+use qia_backup::core::status::AppStatus;
 use qia_backup::core::store::{new_store, new_store_with_upload_throttle};
 use qia_backup::core::throttle::{MIN_UPLOAD_LIMIT_BPS, UploadLimiter};
 use qia_backup::core::versions;
@@ -49,8 +49,6 @@ pub struct AppInner {
     /// A short-lived, action-scoped grant produced by the macOS authentication
     /// prompt. Destructive commands consume it exactly once.
     sensitive_auth: Mutex<Option<SensitiveGrant>>,
-    /// Recent upload completions, used to display a rolling transfer speed.
-    transfer_meter: Arc<Mutex<TransferMeter>>,
     /// Shared, live-updatable limit applied to S3 PUT bodies.
     upload_limiter: Arc<UploadLimiter>,
     /// Sleep/battery policy and the macOS observers that feed it.
@@ -330,14 +328,11 @@ fn get_state(state: State<'_, SharedState>) -> Bootstrap {
 
 #[tauri::command]
 fn get_status(state: State<'_, SharedState>) -> StatusResponse {
-    let speed = state.transfer_meter.lock().snapshot();
     let (limit_enabled, limit_bps) = state.upload_limiter.settings();
     let mut status = state.status.lock().clone();
-    status.upload_speed_bps = if status.running && !status.restoring {
-        speed
-    } else {
-        0
-    };
+    if !status.running || status.restoring {
+        status.upload_speed_bps = 0;
+    }
     status.upload_limit_enabled = limit_enabled;
     status.upload_limit_bytes_per_sec = limit_bps;
     StatusResponse {
@@ -653,13 +648,11 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
         status.power_message = inner.power.message().unwrap_or_default();
     }
     inner.power_pause_requested.store(false, Ordering::SeqCst);
-    inner.transfer_meter.lock().reset();
     logging::info(format!("starting backup ({reason})"));
     let scheduled = reason == "scheduled";
     std::thread::spawn(move || {
         let mut cfg = config;
         let status_arc = inner.status.clone();
-        let transfer_meter = inner.transfer_meter.clone();
         let app_progress = app.clone();
         let mut last_emit = Instant::now();
         let result = match new_store_with_upload_throttle(
@@ -678,7 +671,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                         // event stream: a large backup emits one File event per
                         // file, and forwarding millions of them to the webview is
                         // far more expensive than polling twice a second.
-                        apply_progress(&status_arc, &transfer_meter, &event);
+                        apply_progress(&status_arc, &event);
                         if partial_tree.is_available() {
                             let mut status = status_arc.lock();
                             if !status.partial_available {
@@ -838,11 +831,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
     Ok(())
 }
 
-fn apply_progress(
-    status: &Arc<Mutex<AppStatus>>,
-    transfer_meter: &Arc<Mutex<TransferMeter>>,
-    event: &ProgressEvent,
-) {
+fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
     let mut status = status.lock();
     match event {
         ProgressEvent::Phase { name, detail } => {
@@ -863,14 +852,19 @@ fn apply_progress(
         }
         ProgressEvent::Upload { bytes, .. } => {
             status.bytes_uploaded += *bytes;
-            transfer_meter.lock().record(*bytes);
         }
         ProgressEvent::Transfer {
+            speed_bps,
+            per_worker_bps,
+            utilization,
             target_threads,
             max_threads,
             in_flight,
             ..
         } => {
+            status.upload_speed_bps = *speed_bps;
+            status.upload_per_worker_bps = *per_worker_bps;
+            status.upload_utilization = *utilization;
             status.upload_target_threads = *target_threads;
             status.upload_max_threads = *max_threads;
             status.upload_in_flight = *in_flight;
@@ -1630,7 +1624,6 @@ pub fn run() {
         cancel: Mutex::new(CancelToken::new()),
         partial_tree: PartialTree::new(),
         sensitive_auth: Mutex::new(None),
-        transfer_meter: Arc::new(Mutex::new(TransferMeter::new())),
         upload_limiter,
         power: crate::power::PowerMonitor::start(),
         power_pause_requested: AtomicBool::new(false),

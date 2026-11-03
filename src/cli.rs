@@ -465,14 +465,19 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
             }
             ProgressEvent::Transfer {
                 speed_bps,
+                per_worker_bps,
+                utilization,
                 target_threads,
                 max_threads,
                 in_flight,
+                ..
             } => {
                 if verbose {
                     println!(
-                        "  transfer {:.1} MB/s, {in_flight}/{target_threads} active (max {max_threads})",
-                        speed_bps as f64 / (1024.0 * 1024.0)
+                        "  transfer {:.1} MB/s ({:.1} MB/s/worker, {:.0}% utilized), {in_flight}/{target_threads} active (max {max_threads})",
+                        speed_bps as f64 / (1024.0 * 1024.0),
+                        per_worker_bps as f64 / (1024.0 * 1024.0),
+                        utilization * 100.0,
                     );
                 }
             }

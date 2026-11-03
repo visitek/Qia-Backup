@@ -130,7 +130,14 @@ pub enum ProgressEvent {
     },
     /// Live upload pool statistics for the transfer UI.
     Transfer {
+        /// Live aggregate estimate (active workers x per-worker rate).
         speed_bps: u64,
+        /// Aggregate throughput measured over the meter window.
+        measured_bps: u64,
+        /// Single-worker throughput from bytes / active-worker-seconds.
+        per_worker_bps: u64,
+        /// Fraction of the worker target that was actually transferring.
+        utilization: f64,
         target_threads: u32,
         max_threads: u32,
         in_flight: u32,
@@ -648,6 +655,7 @@ impl<'a> BackupEngine<'a> {
             bytes,
             kind,
             result,
+            ..
         } = done;
         // A PUT can succeed while the response is lost (connection reset
         // after S3 committed the object). Trust the object, not the error, so
@@ -728,6 +736,9 @@ impl<'a> BackupEngine<'a> {
         self.last_upload_target = stats.target_threads;
         (self.progress)(ProgressEvent::Transfer {
             speed_bps: stats.speed_bps,
+            measured_bps: stats.measured_bps,
+            per_worker_bps: stats.per_worker_bps,
+            utilization: stats.utilization,
             target_threads: stats.target_threads as u32,
             max_threads: stats.max_threads as u32,
             in_flight: stats.in_flight as u32,
