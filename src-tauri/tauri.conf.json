@@ -28,8 +28,8 @@
     "active": true,
     "targets": ["app", "dmg"],
     "category": "Utility",
-    "shortDescription": "Qia Backup: Time Machine snapshots to AWS S3",
-    "longDescription": "Qia Backup backs up APFS local snapshots to AWS S3 using content-addressed blobs, packed trees and per-backup records.",
+    "shortDescription": "Qia Backup: Time Machine snapshots to AWS S3 or Backblaze B2",
+    "longDescription": "Qia Backup backs up APFS local snapshots to AWS S3 or Backblaze B2 using content-addressed blobs, packed trees and per-backup records.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

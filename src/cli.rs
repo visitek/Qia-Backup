@@ -12,7 +12,7 @@ use crate::core::diff;
 use crate::core::engine::{CancelToken, ProgressEvent, run_backup};
 use crate::core::error::{BackupError, Result};
 use crate::core::logging;
-use crate::core::model::{AppConfig, DEFAULT_REGION};
+use crate::core::model::{AppConfig, DEFAULT_REGION, StorageProvider};
 use crate::core::preflight;
 use crate::core::restore::{self, RestoreEvent};
 use crate::core::scheduler;
@@ -24,7 +24,7 @@ use crate::core::store::{BlobStore, new_store};
 #[command(
     name = "qia-backupctl",
     version,
-    about = "Qia Backup: Time Machine / APFS snapshot backups to AWS S3"
+    about = "Qia Backup: Time Machine / APFS snapshot backups to AWS S3 or Backblaze B2"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -84,6 +84,12 @@ enum ConfigCommand {
 
 #[derive(Args, Debug, Clone, Default)]
 struct S3Args {
+    /// Destination service. Existing configurations default to aws_s3.
+    #[arg(long, value_enum)]
+    provider: Option<StorageProvider>,
+    /// B2 regional HTTPS S3 endpoint (not the download URL).
+    #[arg(long)]
+    endpoint: Option<String>,
     #[arg(long)]
     bucket: Option<String>,
     #[arg(long)]
@@ -187,20 +193,36 @@ pub fn run() {
 }
 
 fn env_fill(config: &mut AppConfig) {
+    let (key_var, secret_var, region_var) = match config.storage_provider {
+        StorageProvider::AwsS3 => ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"),
+        StorageProvider::BackblazeB2 => {
+            ("B2_APPLICATION_KEY_ID", "B2_APPLICATION_KEY", "B2_REGION")
+        }
+    };
     if config.access_key_id.is_empty() {
-        if let Ok(v) = std::env::var("AWS_ACCESS_KEY_ID") {
+        if let Ok(v) = std::env::var(key_var) {
             config.access_key_id = v;
         }
     }
     if config.secret_access_key.is_empty() {
-        if let Ok(v) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+        if let Ok(v) = std::env::var(secret_var) {
             config.secret_access_key = v;
         }
     }
-    if config.region == DEFAULT_REGION {
-        if let Ok(v) = std::env::var("AWS_REGION").or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        {
+    if config.region == DEFAULT_REGION || config.region.is_empty() {
+        let region = std::env::var(region_var);
+        let region = if config.storage_provider == StorageProvider::AwsS3 {
+            region.or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        } else {
+            region
+        };
+        if let Ok(v) = region {
             config.region = v;
+        }
+    }
+    if config.storage_provider == StorageProvider::BackblazeB2 && config.endpoint.is_empty() {
+        if let Ok(v) = std::env::var("B2_ENDPOINT") {
+            config.endpoint = v;
         }
     }
     if config.bucket.is_empty() {
@@ -215,22 +237,68 @@ fn env_fill(config: &mut AppConfig) {
     }
 }
 
-fn apply_s3(config: &mut AppConfig, args: &S3Args) {
+fn configure_s3(config: &mut AppConfig, args: &S3Args) {
+    let previous_provider = config.storage_provider;
+    let previous_endpoint = config.endpoint.clone();
+    let previous_key = config.access_key_id.clone();
+    if let Some(v) = args.provider {
+        config.storage_provider = v;
+        if v != previous_provider {
+            config.access_key_id.clear();
+            config.secret_access_key.clear();
+            config.endpoint.clear();
+            config.region = if v == StorageProvider::AwsS3 {
+                DEFAULT_REGION.into()
+            } else {
+                String::new()
+            };
+        }
+    }
+    if let Some(v) = &args.endpoint {
+        config.endpoint = v.clone();
+    }
     if let Some(v) = &args.bucket {
         config.bucket = v.clone();
     }
+    if let Some(v) = &args.access_key {
+        config.access_key_id = v.clone();
+    }
+    if previous_provider != config.storage_provider
+        || previous_endpoint != config.endpoint
+        || previous_key != config.access_key_id
+    {
+        config.secret_access_key.clear();
+    }
+    if let Some(v) = &args.secret_key {
+        config.secret_access_key = v.clone();
+    }
+    env_fill(config);
+    // Explicit flags take precedence even when they equal the defaults.
     if let Some(v) = &args.region {
         config.region = v.clone();
     }
     if let Some(v) = &args.prefix {
         config.prefix = v.clone();
     }
-    if let Some(v) = &args.access_key {
-        config.access_key_id = v.clone();
+}
+
+fn destination_config(settings: &config::AppSettings, provider: StorageProvider) -> AppConfig {
+    match settings.profile(provider) {
+        Some(profile) => profile.clone(),
+        // CLI path sources keep their established whole-folder behavior;
+        // desktop recommendations are relative to the APFS data volume.
+        None => AppConfig {
+            included_folders: Vec::new(),
+            exclude_patterns: Vec::new(),
+            ..config::new_profile(provider)
+        },
     }
-    if let Some(v) = &args.secret_key {
-        config.secret_access_key = v.clone();
-    }
+}
+
+fn load_destination_config(args: &S3Args) -> Result<AppConfig> {
+    let settings = config::load_settings()?;
+    let provider = args.provider.unwrap_or(settings.selected_provider);
+    Ok(destination_config(&settings, provider))
 }
 
 fn load_ready() -> Result<AppConfig> {
@@ -267,9 +335,8 @@ fn run_inner(cli: Cli) -> Result<()> {
 }
 
 fn cmd_init(args: InitArgs) -> Result<()> {
-    let mut config = config::load()?;
-    env_fill(&mut config);
-    apply_s3(&mut config, &args.s3);
+    let mut config = load_destination_config(&args.s3)?;
+    configure_s3(&mut config, &args.s3);
     let original_uuid = config.backup_set_uuid.clone();
     let password_supplied = args.password.is_some();
     if let Some(name) = args.name {
@@ -327,7 +394,7 @@ fn cmd_init(args: InitArgs) -> Result<()> {
     };
 
     if args.no_encryption {
-        secrets::delete_encryption_password(&config.backup_set_uuid)?;
+        secrets::delete_encryption_password_for(&config)?;
     }
     // On macOS these go to the login Keychain; `config.json` only keeps
     // non-secret settings.
@@ -382,8 +449,8 @@ fn cmd_test() -> Result<()> {
 }
 
 fn cmd_backup(args: BackupArgs) -> Result<()> {
-    let mut config = load_ready()?;
-    apply_s3(&mut config, &args.s3);
+    let mut config = load_destination_config(&args.s3)?;
+    configure_s3(&mut config, &args.s3);
     let secrets_supplied = args.s3.secret_key.is_some() || args.password.is_some();
     if let Some(source) = args.source {
         config.source_path = source;
@@ -775,4 +842,57 @@ fn cmd_info() -> Result<()> {
             .unwrap_or_else(|| "never".to_string())
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_selects_the_saved_provider_and_keeps_fresh_path_sources_unrestricted() {
+        let b2 = AppConfig {
+            storage_provider: StorageProvider::BackblazeB2,
+            bucket: "saved-b2-bucket".into(),
+            source_kind: "path".into(),
+            source_path: "/saved/source".into(),
+            included_folders: vec!["chosen".into()],
+            ..AppConfig::default()
+        };
+        let settings = config::AppSettings::default().with_profile(&b2);
+        let saved = destination_config(&settings, StorageProvider::BackblazeB2);
+        assert_eq!(saved.bucket, b2.bucket);
+        assert_eq!(saved.source_path, b2.source_path);
+        assert_eq!(saved.included_folders, b2.included_folders);
+        let fresh = destination_config(&settings, StorageProvider::AwsS3);
+        assert_eq!(fresh.storage_provider, StorageProvider::AwsS3);
+        assert!(fresh.bucket.is_empty());
+        assert!(fresh.included_folders.is_empty());
+        assert!(fresh.exclude_patterns.is_empty());
+        assert_ne!(fresh.backup_set_uuid, b2.backup_set_uuid);
+    }
+
+    #[test]
+    fn parses_b2_destination_and_rejects_unknown_provider() {
+        let parsed = Cli::try_parse_from([
+            "qia-backupctl",
+            "init",
+            "--provider",
+            "backblaze_b2",
+            "--endpoint",
+            "https://s3.us-west-004.backblazeb2.com",
+            "--region",
+            "us-west-004",
+            "--bucket",
+            "test.bucket",
+        ])
+        .unwrap();
+        let Commands::Init(args) = parsed.command else {
+            panic!("expected init");
+        };
+        assert_eq!(args.s3.provider, Some(StorageProvider::BackblazeB2));
+        assert_eq!(args.s3.region.as_deref(), Some("us-west-004"));
+        assert!(
+            Cli::try_parse_from(["qia-backupctl", "init", "--provider", "unrecognized"]).is_err()
+        );
+    }
 }

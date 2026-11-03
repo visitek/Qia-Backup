@@ -1,7 +1,13 @@
 /* global window, document, setInterval, clearTimeout */
 
 const tauri = window.__TAURI__;
-const invoke = tauri?.core?.invoke;
+const nativeInvoke = tauri?.core?.invoke;
+const invoke = nativeInvoke
+  ? (command, args) => nativeInvoke(command, {
+      ...args,
+      expectedProvider: state.config?.storageProvider || "aws_s3",
+    })
+  : undefined;
 const listen = tauri?.event?.listen;
 const demo = !invoke;
 
@@ -34,6 +40,13 @@ const DEFAULT_EXCLUDE_PATTERNS = [
 
 const state = {
   config: null,
+  destinations: [],
+  destinationGeneration: 0,
+  switchingDestination: false,
+  operationActive: false,
+  settingsDirty: false,
+  settingsDrafts: new Map(),
+  backupsRequest: 0,
   status: {},
   logs: [],
   backups: [],
@@ -85,7 +98,7 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const views = {
-  dashboard: ["Dashboard", "Your Time Machine snapshots, safely in AWS S3."],
+  dashboard: ["Dashboard", "Your Time Machine snapshots, safely in cloud storage."],
   backups: ["Backups", "Completed records — compare changes or restore any point in time."],
   files: ["Files", "Browse backed-up files and restore a file, folder, or whole backup."],
   settings: ["Settings", "Destination, source, schedule and encryption."],
@@ -289,14 +302,206 @@ function val(id) { return $(id)?.value?.trim() ?? ""; }
 function num(id) { const v = Number($(id)?.value); return Number.isFinite(v) ? v : 0; }
 function checked(id) { return !!$(id)?.checked; }
 
+function selectedProvider() {
+  return state.config?.storageProvider || "aws_s3";
+}
+
+function providerName(provider) {
+  return provider === "backblaze_b2" ? "Backblaze B2" : "AWS S3";
+}
+
+function destinationIdentity(config) {
+  const provider = config?.storageProvider || "aws_s3";
+  const bucket = String(config?.bucket || "").trim();
+  return JSON.stringify([
+    provider,
+    String(config?.endpoint || "").trim().replace(/\/+$/g, ""),
+    provider === "backblaze_b2" ? bucket.toLowerCase() : bucket,
+    String(config?.region || "").trim(),
+    String(config?.prefix || "").replace(/^\/+|\/+$/g, ""),
+    config?.backupSetUuid || "",
+  ]);
+}
+
+function acceptSavedConfig(saved) {
+  if (destinationIdentity(saved) !== destinationIdentity(state.config)) resetDestinationView();
+  state.settingsDrafts.delete(saved.storageProvider || "aws_s3");
+  state.settingsDirty = false;
+  state.config = saved;
+  state.estimateAt = 0;
+}
+
+function saveSettingsDraft() {
+  if (!state.settingsDirty || !state.config) return;
+  const provider = selectedProvider();
+  state.settingsDrafts.set(provider, {
+    ...gatherConfig(),
+    storageProvider: provider,
+    endpoint: provider === "backblaze_b2" ? val("endpoint") : "",
+  });
+}
+
+function resetDestinationView() {
+  state.destinationGeneration += 1;
+  state.backupsRequest += 1;
+  state.filesRequest += 1;
+  state.versionCountsRequest += 1;
+  state.restoreRequest += 1;
+  state.fileDiffRequest += 1;
+  state.contentRequest += 1;
+  state.lastRunning = false;
+  state.backups = [];
+  state.filesRecordKey = "";
+  state.filesPath = "";
+  state.filesEntries = [];
+  state.filesResolvedRecord = "";
+  state.filesLoading = false;
+  state.filesError = "";
+  state.filesNotice = "";
+  state.versionCounts = {};
+  state.versionCountsCache.clear();
+  state.destinationCheck = null;
+  state.storageEstimate = null;
+  state.estimateAt = 0;
+  state.estimateError = "";
+  state.diff = null;
+  state.fileDiff = null;
+  state.progressStart = null;
+  state.progressRun = null;
+  $("test-result").textContent = "";
+  closeConfirm(false);
+  ["diff-modal", "file-diff-modal", "restore-modal", "content-modal"].forEach((id) => $(id)?.classList.add("hidden"));
+}
+
+function applyBootstrap(boot) {
+  const nextProvider = boot.selectedProvider || boot.config.storageProvider || "aws_s3";
+  saveSettingsDraft();
+  if (state.config && (nextProvider !== selectedProvider()
+      || destinationIdentity(boot.config) !== destinationIdentity(state.config))) {
+    resetDestinationView();
+  }
+  state.destinations = boot.destinations || [];
+  state.operationActive = !!boot.operationActive;
+  state.hasSecretAccessKey = !!boot.hasSecretAccessKey;
+  state.hasEncryptionPassword = !!boot.hasEncryptionPassword;
+  state.status = boot.status;
+  state.logs = boot.logs || [];
+  state.configPath = boot.configPath;
+  state.restoreDestination = boot.restoreDestination || "";
+  state.version = boot.version || state.version;
+  state.snapshots = boot.snapshots || [];
+  if (!$("files-dest").value) $("files-dest").value = state.restoreDestination;
+  applyConfig(boot.config);
+  renderLogs();
+  renderBackups();
+  renderFilesRecords();
+  renderEstimate();
+  updateStatus();
+  updateDashboard();
+}
+
+function renderDestinations() {
+  const busy = state.operationActive || state.switchingDestination
+    || !!state.status?.running || !!state.status?.restoring || !!state.status?.editing;
+  for (const [provider, suffix] of [["aws_s3", "aws"], ["backblaze_b2", "b2"]]) {
+    const profile = state.destinations.find((item) => item.storageProvider === provider);
+    const selected = selectedProvider() === provider;
+    const configured = !!profile?.configured;
+    $(`destination-${suffix}`).classList.toggle("selected", selected);
+    $(`destination-${suffix}-state`).textContent = selected ? "Viewing" : (configured ? "Saved" : "Not configured");
+    $(`destination-${suffix}-bucket`).textContent = configured
+      ? `${profile.bucket} · ${profile.backupSetName || "Backup set"}${profile.schedulerPaused === false ? " · Auto on" : ""}`
+      : `Configure ${providerName(provider)} in Settings.`;
+    const powerBlocked = !busy && !!state.status?.powerMessage;
+    $(`backup-${suffix}`).disabled = busy || powerBlocked;
+    $(`backup-${suffix}`).title = powerBlocked ? state.status.powerMessage
+      : (configured ? "Back up using this destination's saved settings" : "Open this destination's Settings first");
+    $(`select-${suffix}`).disabled = busy;
+    $(`select-${suffix}`).setAttribute("aria-pressed", String(selected));
+  }
+  $("storage-provider").disabled = busy;
+  $("test-connection").disabled = busy;
+  $("settings-form").querySelector('button[type="submit"]').disabled = busy;
+  $("destination-context").textContent = `Viewing ${providerName(selectedProvider())}. History, files, settings and estimates follow this destination.`;
+}
+
+async function selectDestination(provider) {
+  if (provider === selectedProvider()) return;
+  if (state.switchingDestination) throw new Error("A destination switch is already in progress");
+  if (state.operationActive || state.status?.running || state.status?.restoring || state.status?.editing) {
+    throw new Error("Wait for the current operation before switching destinations");
+  }
+  saveSettingsDraft();
+  state.switchingDestination = true;
+  state.destinationGeneration += 1;
+  renderDestinations();
+  try {
+    const boot = await invoke("select_destination", { provider });
+    applyBootstrap(boot);
+    await refreshBackups();
+    refreshDestinationCheck();
+    refreshEstimate();
+  } finally {
+    state.switchingDestination = false;
+    $("storage-provider").value = selectedProvider();
+    updateStorageProviderUI();
+    renderDestinations();
+  }
+}
+
+async function startDestinationBackup(provider) {
+  if (demo) return toast("Preview mode — run the macOS app to back up.");
+  try {
+    await selectDestination(provider);
+    if (state.settingsDirty) throw new Error("Save this destination's Settings before starting its backup");
+    const profile = state.destinations.find((item) => item.storageProvider === provider);
+    if (!profile?.configured || !state.config?.bucket || !state.hasSecretAccessKey) {
+      showView("settings");
+      toast(`Configure and save ${providerName(provider)} before its first backup`);
+      return;
+    }
+    const boot = await invoke("start_destination_backup", { provider });
+    applyBootstrap(boot);
+    state.lastRunning = true;
+    toast(`Backup to ${providerName(provider)} started`);
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
 function updateIamPolicyButton() {
   const btn = $("copy-iam-policy");
   if (!btn) return;
   const bucket = val("bucket");
+  const b2 = val("storage-provider") === "backblaze_b2";
+  btn.classList.toggle("hidden", b2);
+  $("copy-b2-requirements").classList.toggle("hidden", !b2);
+  $("copy-b2-requirements").disabled = !bucket;
   btn.disabled = !bucket;
   btn.title = bucket
     ? "Copy an IAM policy scoped to this bucket and prefix"
     : "Fill in the bucket to enable this";
+}
+
+function updateStorageProviderUI() {
+  const b2 = val("storage-provider") === "backblaze_b2";
+  $("endpoint-field").classList.toggle("hidden", !b2);
+  $("b2-setup-hint").classList.toggle("hidden", !b2);
+  $("endpoint").required = b2;
+  $("region").placeholder = b2 ? "us-west-004" : "eu-west-1";
+  $("region-hint").textContent = b2
+    ? "Use the region in the S3 endpoint: s3.us-west-004.backblazeb2.com → us-west-004."
+    : "Use the AWS region containing this bucket.";
+  $("access-key-label").textContent = b2 ? "Application key ID (keyID)" : "Access key ID";
+  $("secret-key-label").textContent = b2 ? "Application key" : "Secret access key";
+  const cfg = state.config || {};
+  const sameAccount = val("storage-provider") === (cfg.storageProvider || "aws_s3")
+    && val("endpoint") === (cfg.endpoint || "")
+    && val("access-key") === (cfg.accessKeyId || "");
+  $("secret-key").placeholder = sameAccount && state.hasSecretAccessKey
+    ? "Saved in macOS Keychain — leave blank to keep"
+    : (b2 ? "Enter the application key for this destination" : "Enter the secret access key for this destination");
+  updateIamPolicyButton();
 }
 
 function iamPolicyJson(bucket, prefix) {
@@ -342,15 +547,17 @@ async function copyText(text) {
 function applyConfig(cfg) {
   state.config = cfg;
   if (!cfg) return;
+  const draft = state.settingsDrafts.get(cfg.storageProvider || "aws_s3");
+  state.settingsDirty = !!draft;
+  cfg = draft || cfg;
+  $("storage-provider").value = cfg.storageProvider || "aws_s3";
+  $("endpoint").value = cfg.endpoint || "";
   $("bucket").value = cfg.bucket || "";
   $("region").value = cfg.region || "";
   $("prefix").value = cfg.prefix || "";
   $("backup-set-uuid").value = cfg.backupSetUuid || "";
   $("access-key").value = cfg.accessKeyId || "";
-  $("secret-key").value = "";
-  $("secret-key").placeholder = state.hasSecretAccessKey
-    ? "Saved in macOS Keychain — leave blank to keep"
-    : "Secret access key";
+  $("secret-key").value = draft ? (draft.secretAccessKey || "") : "";
   $("snapshot-volume").value = cfg.snapshotVolume || "/System/Volumes/Data";
   $("included-folders").value = (cfg.includedFolders || []).join("\n");
   $("excludes").value = (cfg.excludePatterns || []).join("\n");
@@ -362,17 +569,18 @@ function applyConfig(cfg) {
   $("retain-months").value = cfg.retainMonths ?? 12;
   updateRetentionUI();
   $("encryption-enabled").checked = !!cfg.encryptionEnabled;
-  $("encryption-password").value = "";
+  $("encryption-password").value = draft ? (draft.encryptionPassword || "") : "";
   $("encryption-password").placeholder = state.hasEncryptionPassword
     ? "Saved in macOS Keychain — leave blank to keep"
     : "Encryption password";
   $("config-path").textContent = state.configPath || "";
-  updateIamPolicyButton();
+  updateStorageProviderUI();
 }
 
 function resetSourceDefaults() {
   $("included-folders").value = DEFAULT_INCLUDED_FOLDERS.join("\n");
   $("excludes").value = DEFAULT_EXCLUDE_PATTERNS.join("\n");
+  state.settingsDirty = true;
   toast("Recommended folders and cache exclusions restored — click Save settings");
 }
 
@@ -384,6 +592,8 @@ function gatherConfig() {
   const base = state.config || {};
   return {
     ...base,
+    storageProvider: val("storage-provider"),
+    endpoint: val("storage-provider") === "backblaze_b2" ? val("endpoint") : "",
     bucket: val("bucket"),
     region: val("region"),
     prefix: val("prefix"),
@@ -463,6 +673,7 @@ function updateDashboard() {
   $("stat-records").textContent = state.backups.length ? String(state.backups.length) : "—";
   $("version").textContent = `v${state.version}`;
   renderBanner();
+  renderDestinations();
 }
 
 function fmtMoney(value) {
@@ -470,6 +681,9 @@ function fmtMoney(value) {
 }
 
 function renderEstimate() {
+  const b2 = selectedProvider() === "backblaze_b2";
+  $("cost-label").textContent = b2 ? "Estimated Backblaze B2 cost" : "Estimated AWS S3 cost";
+  $("refresh-cost").disabled = false;
   const estimate = state.storageEstimate;
   if (!estimate) {
     $("cost-value").textContent = "—";
@@ -481,8 +695,8 @@ function renderEstimate() {
     return;
   }
   $("cost-value").textContent = fmtMoney(estimate.monthlyEstimate);
-  $("cost-sub").textContent = `${fmtBytes(estimate.bytes)} stored · ${Number(estimate.objects || 0).toLocaleString()} objects · ${Number(estimate.monitoredObjects || 0).toLocaleString()} monitored`;
-  $("cost-range").textContent = `Range ${fmtMoney(estimate.monthlyLow)}–${fmtMoney(estimate.monthlyHigh)}/month`;
+  $("cost-sub").textContent = `${fmtBytes(estimate.bytes)} stored · ${Number(estimate.objects || 0).toLocaleString()} objects${b2 ? "" : ` · ${Number(estimate.monitoredObjects || 0).toLocaleString()} monitored`}`;
+  $("cost-range").textContent = b2 ? "Per 30 days, before account allowances" : `Range ${fmtMoney(estimate.monthlyLow)}–${fmtMoney(estimate.monthlyHigh)}/month`;
   const hasProjection = estimate.projectedBytesLow != null && estimate.projectedBytesHigh != null;
   $("cost-projection").textContent = hasProjection
     ? `After this backup: ~${fmtBytes(estimate.projectedBytesLow)}–${fmtBytes(estimate.projectedBytesHigh)} · ${fmtMoney(estimate.projectedMonthlyLow)}–${fmtMoney(estimate.projectedMonthlyHigh)}/month (rough)`
@@ -506,12 +720,13 @@ async function refreshEstimate(force = false) {
     renderEstimate();
     return;
   }
-  if (refreshEstimate._busy) return;
+  const generation = state.destinationGeneration;
+  if (refreshEstimate._busy === generation) return;
   if (!force && state.storageEstimate && Date.now() - state.estimateAt < 5 * 60 * 1000) {
     renderEstimate();
     return;
   }
-  refreshEstimate._busy = true;
+  refreshEstimate._busy = generation;
   state.estimateError = "";
   $("cost-value").textContent = "…";
   $("cost-sub").textContent = "Reading the backup index…";
@@ -519,16 +734,19 @@ async function refreshEstimate(force = false) {
     const sourceBytes = Number(
       state.status?.totalBytes || state.status?.lastSummary?.bytesScanned || 0
     );
-    state.storageEstimate = await invoke("storage_estimate", {
+    const estimate = await invoke("storage_estimate", {
       sourceBytes: sourceBytes || null,
     });
+    if (generation !== state.destinationGeneration) return;
+    state.storageEstimate = estimate;
     state.estimateAt = Date.now();
   } catch (e) {
+    if (generation !== state.destinationGeneration) return;
     state.storageEstimate = null;
     state.estimateError = `Estimate unavailable: ${e}`;
   } finally {
-    refreshEstimate._busy = false;
-    renderEstimate();
+    if (refreshEstimate._busy === generation) refreshEstimate._busy = null;
+    if (generation === state.destinationGeneration) renderEstimate();
   }
 }
 
@@ -609,11 +827,7 @@ function updateStatus() {
   }
   const missingIncludes =
     !(state.config?.includedFolders || []).some((path) => String(path).trim());
-  const powerBlocked = !busy && !!s.powerMessage;
-  $("backup-now").disabled = busy || missingIncludes || powerBlocked;
-  $("backup-now").title = missingIncludes
-    ? "Select at least one Included folder in Settings"
-    : (powerBlocked ? s.powerMessage : "");
+  renderDestinations();
   $("cancel-run").classList.toggle("hidden", !running);
   $("cancel-run").disabled = !!s.cancelRequested;
   const auto = $("toggle-auto");
@@ -810,13 +1024,18 @@ async function refreshBackups() {
     renderFilesRecords();
     return;
   }
+  const generation = state.destinationGeneration;
+  const request = ++state.backupsRequest;
   // Drop the previous list before the request so a slow or failed refresh can
   // never leave deleted records visible in the Backups view.
   state.backups = [];
   renderBackups();
   try {
-    state.backups = await invoke("list_backups");
+    const backups = await invoke("list_backups");
+    if (generation !== state.destinationGeneration || request !== state.backupsRequest) return;
+    state.backups = backups;
   } catch (e) {
+    if (generation !== state.destinationGeneration || request !== state.backupsRequest) return;
     state.backups = [];
     if (String(e).toLowerCase().includes("credential") || String(e).toLowerCase().includes("bucket")) {
       banner(String(e), true);
@@ -1517,18 +1736,21 @@ async function openDiff(key) {
   $("diff-filter").value = "";
   $("diff-kind").value = "";
   $("diff-modal").classList.remove("hidden");
-  $("diff-meta").textContent = "Loading record trees from S3…";
+  const generation = state.destinationGeneration;
+  $("diff-meta").textContent = "Loading record trees from cloud storage…";
   $("diff-counts").textContent = "";
   $("diff-table").querySelector("tbody").innerHTML =
     '<tr><td colspan="5" class="empty">Loading changes…</td></tr>';
   try {
     const result = await invoke("diff_backup", { record: key, previous: null, limit: 5000 });
+    if (generation !== state.destinationGeneration) return;
     state.diff = result;
     $("diff-meta").textContent = result.previousRecordKey
       ? `Comparing ${fmtDate(result.recordTimestamp)} with ${fmtDate(result.previousTimestamp)}.`
       : "No older record found; every entry is shown as added.";
     renderDiff();
   } catch (e) {
+    if (generation !== state.destinationGeneration) return;
     $("diff-meta").textContent = "Could not load changes.";
     $("diff-table").querySelector("tbody").innerHTML =
       `<tr><td colspan="5" class="empty">${esc(e)}</td></tr>`;
@@ -1722,11 +1944,14 @@ async function refreshLogs() {
 
 async function refreshSnapshots() {
   if (demo) return;
+  const generation = state.destinationGeneration;
   try {
     const res = await invoke("list_snapshots");
+    if (generation !== state.destinationGeneration) return;
     state.snapshots = res.snapshots || [];
     $("snapshot-summary").textContent = `${state.snapshots.length} local snapshot(s)`;
   } catch (e) {
+    if (generation !== state.destinationGeneration) return;
     $("snapshot-summary").textContent = String(e);
   }
 }
@@ -1737,9 +1962,13 @@ async function refreshDestinationCheck() {
     renderBanner();
     return;
   }
+  const generation = state.destinationGeneration;
   try {
-    state.destinationCheck = await invoke("check_destination");
+    const check = await invoke("check_destination");
+    if (generation !== state.destinationGeneration) return;
+    state.destinationCheck = check;
   } catch (_) {
+    if (generation !== state.destinationGeneration) return;
     // A transient network/credential error is reported by Test connection.
     state.destinationCheck = null;
   }
@@ -1753,7 +1982,11 @@ async function loadState({ quiet = false } = {}) {
     state.logs = demoLogs();
     state.backups = demoBackups();
     state.configPath = "~/Library/Application Support/Qia Backup/config.json";
-    banner("Preview mode: run the macOS Tauri build to connect to AWS S3. Settings are editable but not saved.");
+    state.destinations = [
+      { storageProvider: "aws_s3", configured: true, bucket: state.config.bucket, backupSetName: state.config.backupSetName, schedulerPaused: true },
+      { storageProvider: "backblaze_b2", configured: false, bucket: "", backupSetName: "", schedulerPaused: true },
+    ];
+    banner("Preview mode: run the macOS Tauri build to connect to AWS S3 or Backblaze B2. Settings are editable but not saved.");
     applyConfig(state.config);
     renderLogs();
     renderBackups();
@@ -1762,21 +1995,10 @@ async function loadState({ quiet = false } = {}) {
     return;
   }
   try {
+    const generation = state.destinationGeneration;
     const boot = await invoke("get_state");
-    state.config = boot.config;
-    state.hasSecretAccessKey = !!boot.hasSecretAccessKey;
-    state.hasEncryptionPassword = !!boot.hasEncryptionPassword;
-    state.status = boot.status;
-    state.logs = boot.logs || [];
-    state.configPath = boot.configPath;
-    state.restoreDestination = boot.restoreDestination || "";
-    state.version = boot.version || state.version;
-    state.snapshots = boot.snapshots || [];
-    if (!$("files-dest").value) $("files-dest").value = state.restoreDestination;
-    applyConfig(boot.config);
-    renderLogs();
-    updateStatus();
-    updateDashboard();
+    if (generation !== state.destinationGeneration) return;
+    applyBootstrap(boot);
     refreshDestinationCheck();
     await refreshBackups();
     refreshEstimate();
@@ -1791,7 +2013,15 @@ async function poll() {
   if (poll._busy) return;
   poll._busy = true;
   try {
+    const generation = state.destinationGeneration;
     const res = await invoke("get_status");
+    if (generation !== state.destinationGeneration) return;
+    if (res.selectedProvider && res.selectedProvider !== selectedProvider()) {
+      await loadState({ quiet: true });
+      return;
+    }
+    state.destinations = res.destinations || state.destinations;
+    state.operationActive = !!res.operationActive;
     state.status = res.status || {};
     state.logs = res.logs || state.logs;
     updateStatus();
@@ -1840,17 +2070,19 @@ async function setupEvents() {
       } else if (p.kind === "upload") {
         next.bytesUploaded = Number(next.bytesUploaded || 0) + Number(p.bytes || 0);
       } else if (p.kind === "transfer") {
-        next.uploadSpeedBps = Number(p.speedBps || next.uploadSpeedBps || 0);
-        next.uploadTargetThreads = Number(p.targetThreads || 0);
-        next.uploadMaxThreads = Number(p.maxThreads || 0);
-        next.uploadInFlight = Number(p.inFlight || 0);
+        next.uploadSpeedBps = Number(p.speed_bps);
+        next.uploadTargetThreads = Number(p.target_threads);
+        next.uploadMaxThreads = Number(p.max_threads);
+        next.uploadInFlight = Number(p.in_flight);
       }
       state.status = next;
       updateStatus();
     },
     "backup-finished": async () => {
+      const generation = state.destinationGeneration;
       const wasPartial = state.filesRecordKey === "partial";
       await loadState({ quiet: true });
+      if (generation !== state.destinationGeneration) return;
       if (wasPartial && $("view-files")?.classList.contains("active")) {
         state.filesEntries = [];
         state.filesError = "";
@@ -1859,16 +2091,19 @@ async function setupEvents() {
       }
     },
     "backup-failed": (e) => {
-      toast(String(e.payload || "Backup failed"), true);
+      toast(String(e.payload?.message || "Backup failed"), true);
     },
     "backup-cancelled": () => {
       toast("Backup cancelled");
     },
     "backup-paused": async (e) => {
-      toast(String(e.payload || "Backup paused for power conditions"));
+      toast(String(e.payload?.message || "Backup paused for power conditions"));
       if (!demo && invoke) {
+        const generation = state.destinationGeneration;
         try {
           const res = await invoke("get_status");
+          if (generation !== state.destinationGeneration || res.selectedProvider !== selectedProvider()) return;
+          state.operationActive = !!res.operationActive;
           state.status = res.status || state.status;
           updateStatus();
         } catch (_) { /* poll will retry */ }
@@ -1889,22 +2124,30 @@ async function setupEvents() {
       $("files-restore-all").disabled = !!state.status.running || !!state.status.restoring || !!state.status.editing;
     },
     "restore-failed": (e) => {
-      toast(String(e.payload || "Restore failed"), true);
+      toast(String(e.payload?.message || "Restore failed"), true);
       $("files-progress").classList.add("hidden");
       $("files-cancel").classList.add("hidden");
       $("files-restore-all").disabled = !!state.status.running || !!state.status.restoring || !!state.status.editing;
     },
   };
   for (const [name, fn] of Object.entries(handlers)) {
-    try { await listen(name, fn); } catch (_) { /* older runtime */ }
+    await listen(name, (event) => {
+      if (event.payload?.storageProvider !== selectedProvider()) return;
+      return fn(event);
+    });
   }
 }
 
 async function pickBackupPath(kind, purpose) {
   if (demo) return toast("Preview mode — use the macOS app to pick files.");
+  const generation = state.destinationGeneration;
   try {
     const picked = await invoke("pick_backup_path", { kind, purpose });
+    if (generation !== state.destinationGeneration) {
+      return toast("The destination changed; choose the path again for the current destination", true);
+    }
     if (!picked) return;
+    state.settingsDirty = true;
     if (purpose === "include") {
       const current = textareaLines("included-folders");
       if (current.includes(picked.relative)) {
@@ -1935,6 +2178,17 @@ function bind() {
     btn.addEventListener("click", () => showView(btn.dataset.goto));
   });
   $("bucket").addEventListener("input", updateIamPolicyButton);
+  $("storage-provider").addEventListener("change", async () => {
+    const provider = val("storage-provider");
+    if (demo) { updateStorageProviderUI(); return; }
+    try { await selectDestination(provider); }
+    catch (error) { $("storage-provider").value = selectedProvider(); toast(String(error), true); }
+  });
+  $("settings-form").addEventListener("input", (event) => {
+    if (event.target.id !== "storage-provider") state.settingsDirty = true;
+  });
+  $("endpoint").addEventListener("input", updateStorageProviderUI);
+  $("access-key").addEventListener("input", updateStorageProviderUI);
   $("add-included-folder").addEventListener("click", () => pickBackupPath("folder", "include"));
   $("add-excluded-file").addEventListener("click", () => pickBackupPath("file", "exclude"));
   $("add-excluded-folder").addEventListener("click", () => pickBackupPath("folder", "exclude"));
@@ -1950,13 +2204,18 @@ function bind() {
     $("retain-weeks").value = 8;
     $("retain-months").value = 12;
     updateRetentionUI();
+    state.settingsDirty = true;
     toast("Retention reset to the default policy");
   });
-  $("backup-now").addEventListener("click", async () => {
-    if (demo) return toast("Preview mode — run the macOS app to back up.");
-    try { await invoke("start_backup"); state.lastRunning = true; toast("Backup started"); }
-    catch (e) { toast(String(e), true); }
-  });
+  $("backup-aws").addEventListener("click", () => startDestinationBackup("aws_s3"));
+  $("backup-b2").addEventListener("click", () => startDestinationBackup("backblaze_b2"));
+  for (const [id, provider] of [["select-aws", "aws_s3"], ["select-b2", "backblaze_b2"]]) {
+    $(id).addEventListener("click", async () => {
+      if (demo) return toast("Preview mode — destination profiles are not saved.");
+      try { await selectDestination(provider); }
+      catch (error) { toast(String(error), true); }
+    });
+  }
   $("toggle-auto").addEventListener("click", async () => {
     if (demo) return toast("Preview mode — automatic backups are not scheduled.");
     if ((state.config?.scheduleMinutes || 0) === 0) {
@@ -1974,6 +2233,7 @@ function bind() {
     const uuid = globalThis.crypto?.randomUUID?.() ||
       `new-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
     $("backup-set-uuid").value = uuid;
+    state.settingsDirty = true;
     $("encryption-password").value = "";
     $("encryption-password").placeholder = "Enter a password for the new backup set";
     toast("New backup set UUID generated — review encryption settings and save.");
@@ -2019,16 +2279,22 @@ function bind() {
   $("settings-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     if (demo) return toast("Preview mode — settings are not saved.");
+    const generation = state.destinationGeneration;
     try {
       const saved = await invoke("save_config", { config: gatherConfig() });
-      state.config = saved;
-      state.estimateAt = 0;
+      if (generation !== state.destinationGeneration) return;
+      acceptSavedConfig(saved);
       toast("Settings saved");
       await loadState({ quiet: true });
     } catch (e) { toast(String(e), true); }
   });
-  $("reload-settings").addEventListener("click", () => loadState());
+  $("reload-settings").addEventListener("click", () => {
+    state.settingsDrafts.delete(selectedProvider());
+    state.settingsDirty = false;
+    loadState();
+  });
   $("copy-iam-policy").addEventListener("click", async () => {
+    if (val("storage-provider") !== "aws_s3") return;
     const bucket = val("bucket");
     if (!bucket) return toast("Enter a bucket first", true);
     try {
@@ -2038,20 +2304,33 @@ function bind() {
       toast(String(e), true);
     }
   });
+  $("copy-b2-requirements").addEventListener("click", async () => {
+    if (val("storage-provider") !== "backblaze_b2") return;
+    const prefix = val("prefix").replace(/\/+$/g, "");
+    try {
+      await copyText(`Backblaze B2 application-key requirements\nBucket: ${val("bucket")}\nName prefix: ${prefix ? `${prefix}/` : "(no prefix restriction)"}\nCapabilities: listFiles, readFiles, writeFiles, deleteFiles\nCreate a dedicated Read and Write application key for this bucket and prefix. The master application key cannot use the S3-compatible API. This is not an AWS IAM policy.`);
+      toast("B2 application-key requirements copied");
+    } catch (error) { toast(String(error), true); }
+  });
   $("test-connection").addEventListener("click", async () => {
     if (demo) return toast("Preview mode — no S3 connection.");
+    let generation = state.destinationGeneration;
     const out = $("test-result");
     out.textContent = "Testing…";
     out.className = "test-result";
     try {
       const saved = await invoke("save_config", { config: gatherConfig() });
-      state.config = saved;
-      state.estimateAt = 0;
+      if (generation !== state.destinationGeneration) return;
+      acceptSavedConfig(saved);
+      generation = state.destinationGeneration;
       const msg = await invoke("test_connection");
+      if (generation !== state.destinationGeneration) return;
+      await loadState({ quiet: true });
+      if (generation !== state.destinationGeneration) return;
       out.textContent = msg;
       out.className = "test-result ok";
-      refreshDestinationCheck();
     } catch (e) {
+      if (generation !== state.destinationGeneration) return;
       out.textContent = String(e);
       out.className = "test-result bad";
     }
@@ -2251,6 +2530,8 @@ function demoConfig() {
     backupSetUuid: "5f1c1d3e-demo-4c3a-9f5e-000000000001",
     backupSetName: "MacBook Pro — Time Machine",
     bucket: "my-time-machine-backups",
+    storageProvider: "aws_s3",
+    endpoint: "",
     region: "eu-west-1",
     prefix: "qia-backups",
     accessKeyId: "AKIAIOSFODNN7EXAMPLE",

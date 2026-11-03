@@ -4,8 +4,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::core::error::{BackupError, IoContext, Result};
+use crate::core::error::{BackupError, Result};
 use crate::core::model::{AppConfig, LEGACY_DEFAULT_EXCLUDE_PATTERNS};
+use crate::core::settings::{self, SettingsDocument};
+
+pub use crate::core::settings::{AppSettings, new_profile};
 
 pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -77,124 +80,108 @@ pub fn strip_legacy_default_excludes(patterns: &mut Vec<String>) -> usize {
     before - patterns.len()
 }
 
+/// Load the selected destination for existing CLI callers. An unconfigured
+/// installation gets a new independent draft and is not written to disk.
 pub fn load() -> Result<AppConfig> {
+    let settings = load_settings()?;
+    Ok(settings
+        .selected_profile()
+        .cloned()
+        .unwrap_or_else(|| new_profile(settings.selected_provider)))
+}
+
+/// Load both destination profiles from the single canonical config file.
+/// A legacy single profile is migrated only into its actual provider's slot;
+/// its UUID and complete non-secret configuration are preserved verbatim.
+/// On macOS its legacy encryption password is copied into that destination's
+/// scoped Keychain account before the atomic document replacement.
+pub fn load_settings() -> Result<AppSettings> {
     let path = config_path();
-    if !path.exists() {
-        return Ok(AppConfig::default());
-    }
-    let bytes = std::fs::read(&path).at(&path)?;
-    let mut cfg: AppConfig = serde_json::from_slice(&bytes)?;
-    if cfg.backup_set_uuid.trim().is_empty() {
-        cfg.backup_set_uuid = uuid::Uuid::new_v4().to_string();
-    }
-    if cfg.snapshot_volume.trim().is_empty() {
-        cfg.snapshot_volume = default_snapshot_volume();
-    }
-    if cfg.pack_size_bytes == 0 {
-        cfg.pack_size_bytes = 64 * 1024 * 1024;
-    }
-    if cfg.chunk_size == 0 {
-        cfg.chunk_size = 1024 * 1024;
-    }
-    // Older versions stored a broad default exclusion list in config.json.
-    // Remove those entries so the new metadata-only behavior takes effect,
-    // while keeping any custom patterns the user added.
-    strip_legacy_default_excludes(&mut cfg.exclude_patterns);
-    #[cfg(target_os = "macos")]
-    load_keychain_secrets(&mut cfg)?;
-    Ok(cfg)
-}
-
-/// Load secrets from the macOS Keychain, migrating any plaintext values that
-/// are still present in `config.json` from older versions.
-#[cfg(target_os = "macos")]
-fn load_keychain_secrets(config: &mut AppConfig) -> Result<()> {
-    let legacy_secret = config.secret_access_key.clone();
-    let legacy_password = config.encryption_password.clone();
-    let legacy_present = !legacy_secret.is_empty() || !legacy_password.is_empty();
-    let stored = crate::core::secrets::load(&config.backup_set_uuid)?;
-    let mut needs_migration = false;
-
-    if let Some(value) = stored.secret_access_key {
-        config.secret_access_key = value;
-    } else if !legacy_secret.is_empty() {
-        config.secret_access_key = legacy_secret;
-        needs_migration = true;
-    }
-
-    if let Some(value) = stored.encryption_password {
-        config.encryption_password = value;
-    } else if !legacy_password.is_empty() {
-        config.encryption_password = legacy_password;
-        needs_migration = true;
-    }
-
-    if legacy_present {
-        if needs_migration {
-            crate::core::secrets::store(config)?;
+    match settings::read_document(&path)? {
+        None => Ok(AppSettings::default()),
+        Some(SettingsDocument::Legacy(profile)) => {
+            let stored = crate::core::secrets::load_legacy_for(&profile)?;
+            let profile = profile_with_secrets(&profile, stored);
+            crate::core::secrets::store(&profile)?;
+            let settings = AppSettings::default().with_profile(&profile);
+            settings::write_document(&path, &settings)?;
+            Ok(settings)
         }
-        // `write_config` omits secrets on macOS, so this removes the plaintext
-        // copy that older versions wrote to disk.
-        write_config(config)?;
-        crate::core::logging::info(
-            "migrated AWS secret / encryption password from config.json to the macOS Keychain",
-        );
+        Some(SettingsDocument::Current(stored_settings)) => {
+            let settings = AppSettings {
+                aws_s3: stored_settings
+                    .aws_s3
+                    .as_ref()
+                    .map(load_profile_secrets)
+                    .transpose()?,
+                backblaze_b2: stored_settings
+                    .backblaze_b2
+                    .as_ref()
+                    .map(load_profile_secrets)
+                    .transpose()?,
+                ..stored_settings.clone()
+            };
+            #[cfg(target_os = "macos")]
+            if [&stored_settings.aws_s3, &stored_settings.backblaze_b2]
+                .into_iter()
+                .flatten()
+                .any(|profile| {
+                    !profile.secret_access_key.is_empty() || !profile.encryption_password.is_empty()
+                })
+            {
+                // Hydration first stored any legacy plaintext values in their
+                // owned Keychain accounts; remove their on-disk copies now.
+                settings::write_document(&path, &settings)?;
+            }
+            Ok(settings)
+        }
     }
-    Ok(())
 }
 
+fn profile_with_secrets(
+    profile: &AppConfig,
+    stored: crate::core::secrets::StoredSecrets,
+) -> AppConfig {
+    AppConfig {
+        secret_access_key: stored
+            .secret_access_key
+            .unwrap_or_else(|| profile.secret_access_key.clone()),
+        encryption_password: stored
+            .encryption_password
+            .unwrap_or_else(|| profile.encryption_password.clone()),
+        ..profile.clone()
+    }
+}
+
+fn load_profile_secrets(profile: &AppConfig) -> Result<AppConfig> {
+    let stored = crate::core::secrets::load_for(profile)?;
+    let loaded = profile_with_secrets(profile, stored);
+    #[cfg(target_os = "macos")]
+    if !profile.secret_access_key.is_empty() || !profile.encryption_password.is_empty() {
+        crate::core::secrets::store(&loaded)?;
+    }
+    Ok(loaded)
+}
+
+/// Save the active CLI plan without dropping the other saved destination.
+/// Callers persist changed secrets through `secrets` before saving settings.
 pub fn save(config: &AppConfig) -> Result<()> {
     validate(config)?;
-    write_config(config)
+    let settings = load_settings()?.with_profile(config);
+    save_settings(&settings)
 }
 
-fn write_config(config: &AppConfig) -> Result<()> {
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).at(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(config)?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        use std::io::Write;
-        let mut file = options.open(&tmp).at(&tmp)?;
-        file.write_all(&bytes).at(&tmp)?;
-        file.sync_all().at(&tmp)?;
-    }
-    std::fs::rename(&tmp, &path).at(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+/// Atomically save both profiles into config.json. AppConfig's macOS
+/// serialization omits secret keys and encryption passwords; they remain in
+/// their destination-owned Keychain accounts.
+pub fn save_settings(settings: &AppSettings) -> Result<()> {
+    settings::write_document(&config_path(), settings)
 }
 
 /// Validate just enough to reach S3. Used by preflight checks so an existing
 /// encrypted set can be inspected even when the local password is missing.
 pub fn validate_connection(config: &AppConfig) -> Result<()> {
-    if config.bucket.trim().is_empty() {
-        return Err(BackupError::Config("S3 bucket is required".into()));
-    }
-    if config.region.trim().is_empty() {
-        return Err(BackupError::Config("AWS region is required".into()));
-    }
-    if config.access_key_id.trim().is_empty() {
-        return Err(BackupError::Config("AWS access key ID is required".into()));
-    }
-    if config.secret_access_key.trim().is_empty() {
-        return Err(BackupError::Config(
-            "AWS secret access key is required".into(),
-        ));
-    }
-    Ok(())
+    crate::core::store::S3Config::from_app(config).validate()
 }
 
 pub fn validate(config: &AppConfig) -> Result<()> {

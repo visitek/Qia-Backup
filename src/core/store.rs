@@ -1,12 +1,15 @@
 //! Object storage: a small trait, a local filesystem implementation for tests,
-//! and an AWS S3 implementation with SigV4 signing.
+//! and AWS S3 / Backblaze B2 implementations using SigV4 signing.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::Deserialize;
 
 use crate::core::crypto::{hmac_sha256, sha256_hex};
@@ -195,6 +198,10 @@ impl BlobStore for LocalStore {
 
 #[derive(Clone)]
 pub struct S3Config {
+    pub storage_provider: crate::core::model::StorageProvider,
+    pub endpoint: String,
+    /// Prefix used by the read-only connection probe, including the set UUID.
+    pub list_prefix: String,
     pub bucket: String,
     pub region: String,
     pub access_key_id: String,
@@ -204,6 +211,8 @@ pub struct S3Config {
 impl std::fmt::Debug for S3Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Config")
+            .field("storage_provider", &self.storage_provider)
+            .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
             .field("region", &self.region)
             .field("access_key_id", &self.access_key_id)
@@ -222,11 +231,88 @@ impl std::fmt::Debug for S3Config {
 impl S3Config {
     pub fn from_app(config: &crate::core::model::AppConfig) -> Self {
         Self {
+            storage_provider: config.storage_provider,
+            endpoint: config.endpoint.trim().trim_end_matches('/').to_string(),
+            list_prefix: format!("{}/", config.key_root()),
             bucket: config.bucket.trim().to_string(),
             region: config.region.trim().to_string(),
             access_key_id: config.access_key_id.trim().to_string(),
             secret_access_key: config.secret_access_key.clone(),
         }
+    }
+
+    /// Validate routing before any signed request can send credentials. B2 uses
+    /// its service endpoint, never a console/download URL or arbitrary host.
+    pub fn validate(&self) -> Result<()> {
+        use crate::core::model::StorageProvider;
+        let valid_bucket = match self.storage_provider {
+            StorageProvider::AwsS3 => {
+                !self.bucket.is_empty()
+                    && self
+                        .bucket
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-".contains(&b))
+            }
+            StorageProvider::BackblazeB2 => {
+                (6..=63).contains(&self.bucket.len())
+                    && self
+                        .bucket
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+                    && !self.bucket.starts_with('.')
+                    && !self.bucket.ends_with('.')
+                    && !self.bucket.contains("..")
+                    && !self.bucket.to_ascii_lowercase().starts_with("b2-")
+                    && self.bucket.parse::<std::net::Ipv4Addr>().is_err()
+            }
+        };
+        if !valid_bucket {
+            let message = match self.storage_provider {
+                StorageProvider::AwsS3 => {
+                    "S3 bucket is required and must contain lowercase letters, digits, dots or hyphens"
+                }
+                StorageProvider::BackblazeB2 => {
+                    "B2 bucket must be 6–63 ASCII letters, digits, dots or hyphens; no leading/trailing/adjacent dots, IP addresses or reserved b2- prefix"
+                }
+            };
+            return Err(BackupError::Config(message.into()));
+        }
+        if self.region.is_empty()
+            || !self
+                .region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(BackupError::Config("S3 signing region is required and must contain lowercase letters, digits or hyphens".into()));
+        }
+        match self.storage_provider {
+            StorageProvider::AwsS3 if !self.endpoint.is_empty() => {
+                return Err(BackupError::Config(
+                    "AWS S3 uses its regional endpoint; clear the endpoint or select Backblaze B2"
+                        .into(),
+                ));
+            }
+            StorageProvider::BackblazeB2 => {
+                let expected = format!("https://s3.{}.backblazeb2.com", self.region);
+                if self.endpoint != expected {
+                    return Err(BackupError::Config(format!(
+                        "B2 endpoint must be {expected}; copy the bucket's S3 endpoint and matching region (no bucket name, path, credentials, port or query)"
+                    )));
+                }
+            }
+            StorageProvider::AwsS3 => {}
+        }
+        let (key_name, secret_name) = match self.storage_provider {
+            StorageProvider::AwsS3 => ("AWS access key ID", "AWS secret access key"),
+            StorageProvider::BackblazeB2 => ("B2 application key ID", "B2 application key"),
+        };
+        if self.access_key_id.trim().is_empty() {
+            return Err(BackupError::Config(format!("{key_name} is required")));
+        }
+        if self.secret_access_key.trim().is_empty() {
+            return Err(BackupError::Config(format!("{secret_name} is required")));
+        }
+        Ok(())
     }
 }
 
@@ -257,15 +343,50 @@ struct S3Response {
     headers: reqwest::header::HeaderMap,
 }
 
+// B2 can order same-name uploads/hides incorrectly inside one second. Keep
+// per-key mutation clocks across stores (the GUI opens a new store for prune),
+// while unrelated uploads remain concurrent. This does not coordinate writers
+// in separate processes. Idle entries expire so a large backup stays bounded.
+type MutationClock = Arc<Mutex<Option<Instant>>>;
+static B2_MUTATIONS: OnceLock<Mutex<BTreeMap<String, MutationClock>>> = OnceLock::new();
+const B2_MUTATION_INTERVAL: Duration = Duration::from_millis(1_100);
+
+fn b2_mutation_clock(config: &S3Config, key: &str) -> MutationClock {
+    let identity = format!(
+        "{}/{}/{}",
+        config.region,
+        config.bucket.to_ascii_lowercase(),
+        key
+    );
+    let mut clocks = B2_MUTATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock();
+    clocks.retain(|_, clock| {
+        Arc::strong_count(clock) > 1
+            || clock
+                .try_lock()
+                .is_none_or(|last| last.is_some_and(|time| time.elapsed() < B2_MUTATION_INTERVAL))
+    });
+    Arc::clone(
+        clocks
+            .entry(identity)
+            .or_insert_with(|| Arc::new(Mutex::new(None))),
+    )
+}
+
+fn wait_for_b2_mutation(last: Option<Instant>) {
+    if let Some(last) = last {
+        if let Some(remaining) = B2_MUTATION_INTERVAL.checked_sub(last.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
 impl S3Store {
     pub fn new(config: S3Config) -> Result<Self> {
-        if config.bucket.is_empty() {
-            return Err(BackupError::S3("bucket is empty".into()));
-        }
-        if config.region.is_empty() {
-            return Err(BackupError::S3("region is empty".into()));
-        }
+        config.validate()?;
         let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(20))
             .timeout(Duration::from_secs(600))
             .user_agent(format!("backup/{}", env!("CARGO_PKG_VERSION")))
@@ -308,20 +429,26 @@ impl S3Store {
 
     fn target(&self, key: &str, query: &[(String, String)]) -> Result<RequestTarget> {
         let escaped_key = uri_encode_path(key);
-        // AWS only supports virtual-hosted-style bucket addressing.
-        let host = format!(
-            "{}.s3.{}.amazonaws.com",
-            self.config.bucket, self.config.region
-        );
-        let scheme = String::from("https");
-        let path = format!("/{escaped_key}");
+        let (host, path) = match self.config.storage_provider {
+            crate::core::model::StorageProvider::AwsS3 => (
+                format!(
+                    "{}.s3.{}.amazonaws.com",
+                    self.config.bucket, self.config.region
+                ),
+                format!("/{escaped_key}"),
+            ),
+            crate::core::model::StorageProvider::BackblazeB2 => (
+                format!("s3.{}.backblazeb2.com", self.config.region),
+                format!("/{}/{escaped_key}", self.config.bucket),
+            ),
+        };
         let canonical_query = canonical_query(query);
         let query_suffix = if canonical_query.is_empty() {
             String::new()
         } else {
             format!("?{canonical_query}")
         };
-        let url = format!("{scheme}://{host}{path}{query_suffix}");
+        let url = format!("https://{host}{path}{query_suffix}");
         Ok(RequestTarget {
             url,
             host,
@@ -422,6 +549,16 @@ impl S3Store {
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| BackupError::S3(format!("invalid method: {e}")))?;
 
+        let clock = if self.config.storage_provider
+            == crate::core::model::StorageProvider::BackblazeB2
+            && matches!(method_name, "PUT" | "DELETE")
+        {
+            Some(b2_mutation_clock(&self.config, key))
+        } else {
+            None
+        };
+        // Hold only this key's lock until the request and its retries finish.
+        let mut last_mutation = clock.as_ref().map(|clock| clock.lock());
         let mut last_error = String::new();
         // Bounded retries with exponential backoff. This absorbs short Wi-Fi
         // drops and S3 throttling; longer outages abort safely and the
@@ -439,7 +576,14 @@ impl S3Store {
             if let Some(body) = body {
                 req = req.body(body.to_vec());
             }
-            match req.send() {
+            if let Some(last) = &last_mutation {
+                wait_for_b2_mutation(**last);
+            }
+            let response = req.send();
+            if let Some(last) = &mut last_mutation {
+                **last = Some(Instant::now());
+            }
+            match response {
                 Ok(response) => {
                     let status = response.status().as_u16();
                     let response_headers = response.headers().clone();
@@ -520,7 +664,7 @@ impl S3Store {
     }
 
     pub fn test_connection(&self) -> Result<()> {
-        self.list_page("", None, 1)?;
+        self.list_page(&self.config.list_prefix, None, 1)?;
         Ok(())
     }
 
@@ -897,6 +1041,9 @@ mod tests {
     fn sigv4_matches_aws_reference_vector() {
         use chrono::TimeZone;
         let store = S3Store::new(S3Config {
+            storage_provider: crate::core::model::StorageProvider::AwsS3,
+            endpoint: String::new(),
+            list_prefix: "root/".into(),
             bucket: "test-bucket".into(),
             region: "us-east-1".into(),
             access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
@@ -919,6 +1066,166 @@ mod tests {
             auth,
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=d717e625459e73ca59996a42c07b4ac75570844f087bec7536dcd4bdde17b18f"
         );
+    }
+
+    fn b2_config() -> S3Config {
+        S3Config {
+            storage_provider: crate::core::model::StorageProvider::BackblazeB2,
+            endpoint: "https://s3.us-west-004.backblazeb2.com".into(),
+            list_prefix: "qia-backups/set/".into(),
+            bucket: "test.bucket".into(),
+            region: "us-west-004".into(),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+        }
+    }
+
+    #[test]
+    fn b2_path_style_signing_and_encoded_listing() {
+        use chrono::TimeZone;
+        let store = S3Store::new(b2_config()).unwrap();
+        let target = store.target("folder/a b+%.txt", &[]).unwrap();
+        assert_eq!(
+            target.url,
+            "https://s3.us-west-004.backblazeb2.com/test.bucket/folder/a%20b%2B%25.txt"
+        );
+        assert_eq!(target.canonical_uri, "/test.bucket/folder/a%20b%2B%25.txt");
+        let headers = store
+            .sign_at(
+                "PUT",
+                &target,
+                &sha256_hex(b"hello"),
+                &[],
+                Utc.with_ymd_and_hms(2013, 5, 24, 0, 0, 0).unwrap(),
+            )
+            .unwrap();
+        let auth = &headers
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .unwrap()
+            .1;
+        // Independently calculated with Python hashlib/hmac and the SigV4
+        // canonical request, including the bucket in the signed path.
+        assert_eq!(
+            auth,
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a55236cc176dada11985a308f9789ec863d4c999365516d736f3a33ec4ed3e20"
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name == "x-amz-storage-class")
+        );
+        let listing = store
+            .target(
+                "",
+                &[
+                    ("prefix".into(), "qia-backups/set/".into()),
+                    ("continuation-token".into(), "a+/=".into()),
+                    ("list-type".into(), "2".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(listing.canonical_uri, "/test.bucket/");
+        assert_eq!(
+            listing.canonical_query,
+            "continuation-token=a%2B%2F%3D&list-type=2&prefix=qia-backups%2Fset%2F"
+        );
+    }
+
+    #[test]
+    fn b2_rejects_untrusted_or_mismatched_endpoints_before_requests() {
+        for endpoint in [
+            "",
+            "http://s3.us-west-004.backblazeb2.com",
+            "https://s3.us-west-004.backblazeb2.com.evil.example",
+            "https://user:secret@s3.us-west-004.backblazeb2.com",
+            "https://s3.us-east-005.backblazeb2.com",
+            "https://s3.us-west-004.backblazeb2.com:443",
+            "https://s3.us-west-004.backblazeb2.com/bucket",
+            "https://s3.us-west-004.backblazeb2.com?token=private",
+        ] {
+            let mut config = b2_config();
+            config.endpoint = endpoint.into();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("B2 endpoint must be"));
+            assert!(!error.contains("token=private") && !error.contains("user:secret"));
+        }
+        let mut config = b2_config();
+        config.secret_access_key.clear();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("B2 application key is required")
+        );
+        config.storage_provider = crate::core::model::StorageProvider::AwsS3;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("clear the endpoint")
+        );
+    }
+
+    #[test]
+    fn b2_accepts_legacy_uppercase_buckets_and_enforces_naming_rules() {
+        let mut config = b2_config();
+        config.bucket = "My.Backup-Bucket".into();
+        config.validate().unwrap();
+        let key = format!("case-test/{}", uuid::Uuid::new_v4());
+        let uppercase = b2_mutation_clock(&config, &key);
+        config.bucket = config.bucket.to_ascii_lowercase();
+        assert!(Arc::ptr_eq(&uppercase, &b2_mutation_clock(&config, &key)));
+        for bucket in [
+            "short",
+            ".bucket",
+            "bucket.",
+            "bucket..bad",
+            "192.168.5.4",
+            "B2-reserved",
+            "bucket/path",
+        ] {
+            config.bucket = bucket.into();
+            assert!(config.validate().is_err(), "accepted invalid B2 bucket");
+        }
+    }
+
+    #[test]
+    fn b2_connection_prefix_and_endpoint_are_normalized() {
+        let config = crate::core::model::AppConfig {
+            storage_provider: crate::core::model::StorageProvider::BackblazeB2,
+            endpoint: " https://s3.us-west-004.backblazeb2.com/ ".into(),
+            bucket: "test.bucket".into(),
+            region: "us-west-004".into(),
+            prefix: "qia-backups".into(),
+            backup_set_uuid: "set".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            ..crate::core::model::AppConfig::default()
+        };
+        let s3 = S3Config::from_app(&config);
+        s3.validate().unwrap();
+        assert_eq!(s3.endpoint, "https://s3.us-west-004.backblazeb2.com");
+        assert_eq!(s3.list_prefix, "qia-backups/set/");
+    }
+
+    #[test]
+    fn b2_mutations_share_clock_across_stores_but_not_keys() {
+        let first = b2_config();
+        let second = b2_config();
+        let key = format!("mutation-test/{}", uuid::Uuid::new_v4());
+        let clock = b2_mutation_clock(&first, &key);
+        let same = b2_mutation_clock(&second, &key);
+        let other = b2_mutation_clock(&second, &format!("{key}-other"));
+        assert!(Arc::ptr_eq(&clock, &same));
+        assert!(!Arc::ptr_eq(&clock, &other));
+        assert!(other.try_lock().is_some());
+        let completed = Instant::now();
+        *clock.lock() = Some(completed);
+        wait_for_b2_mutation(*same.lock());
+        assert!(completed.elapsed() >= B2_MUTATION_INTERVAL);
     }
 
     #[test]
@@ -956,6 +1263,9 @@ mod tests {
     #[test]
     fn adopted_server_clock_is_used_for_signing() {
         let store = S3Store::new(S3Config {
+            storage_provider: crate::core::model::StorageProvider::AwsS3,
+            endpoint: String::new(),
+            list_prefix: "root/".into(),
             bucket: "test-bucket".into(),
             region: "us-east-1".into(),
             access_key_id: "key".into(),
@@ -972,6 +1282,9 @@ mod tests {
     #[test]
     fn implausible_server_clock_is_rejected() {
         let store = S3Store::new(S3Config {
+            storage_provider: crate::core::model::StorageProvider::AwsS3,
+            endpoint: String::new(),
+            list_prefix: "root/".into(),
             bucket: "test-bucket".into(),
             region: "us-east-1".into(),
             access_key_id: "key".into(),

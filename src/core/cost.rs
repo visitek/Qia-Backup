@@ -1,9 +1,11 @@
-//! Rough S3 Intelligent-Tiering cost estimate for the stored backup set.
+//! Rough storage cost estimates for the stored backup set.
 //!
 //! AWS bills Intelligent-Tiering per object and per access tier. A LIST request
 //! only exposes the total stored bytes and object sizes, not the current access
 //! tier of each object, so this module deliberately reports a range based on a
-//! documented tier mix. It is a planning aid, not an AWS bill.
+//! documented tier mix. B2 uses a flat rate per decimal TB. Both estimates use
+//! the current blob index and exclude noncurrent versions and account-wide
+//! allowances. They are planning aids, not provider bills.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +13,7 @@ use serde::Serialize;
 
 use crate::core::error::{BackupError, Result};
 use crate::core::index::BlobIndex;
-use crate::core::model::AppConfig;
+use crate::core::model::{AppConfig, StorageProvider};
 use crate::core::record;
 use crate::core::store::BlobStore;
 
@@ -31,22 +33,28 @@ pub const ASSUMED_INFREQUENT: f64 = 0.20;
 pub const ASSUMED_ARCHIVE_INSTANT: f64 = 0.70;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+const DECIMAL_TB: f64 = 1_000_000_000_000.0;
+
+/// B2 pay-as-you-go storage price, USD per decimal TB held for 30 days.
+/// Verified at https://www.backblaze.com/cloud-storage/pricing on 2026-11-03.
+pub const B2_PER_TB_MONTH: f64 = 6.95;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageEstimate {
+    pub storage_provider: StorageProvider,
     pub bytes: u64,
     pub objects: u64,
     pub monitored_objects: u64,
     pub prefix: String,
     pub region: String,
-    /// Blended estimate using `ASSUMED_*` tier percentages, including monitoring.
+    /// AWS blends `ASSUMED_*` tiers and monitoring; B2 uses its flat storage rate.
     pub monthly_estimate: f64,
-    /// Everything in Archive Instant Access, plus monitoring.
+    /// AWS all-Archive Instant Access cost; B2 equals the flat estimate.
     pub monthly_low: f64,
-    /// Everything in Frequent Access, plus monitoring.
+    /// AWS all-Frequent Access cost; B2 equals the flat estimate.
     pub monthly_high: f64,
-    /// All stored bytes at the Frequent Access rate.
+    /// AWS all-Frequent Access cost. Zero for B2 because access tiers do not apply.
     pub monthly_frequent: f64,
     /// All stored bytes at the Infrequent Access rate.
     pub monthly_infrequent: f64,
@@ -62,7 +70,7 @@ pub struct StorageEstimate {
     /// Rough projected stored bytes once that source is fully backed up.
     pub projected_bytes_low: Option<u64>,
     pub projected_bytes_high: Option<u64>,
-    /// Monthly cost at those projected sizes using the same assumed tier mix.
+    /// Monthly cost at those projected sizes using this provider's pricing.
     pub projected_monthly_low: Option<f64>,
     pub projected_monthly_high: Option<f64>,
     pub projection_basis: String,
@@ -86,14 +94,16 @@ impl StorageEstimate {
         let high_objects = scale_count(self.objects, high, self.bytes);
         let low_monitored = scale_count(self.monitored_objects, low, self.bytes);
         let high_monitored = scale_count(self.monitored_objects, high, self.bytes);
-        let low_est = estimate_from_usage(
+        let low_est = estimate_for_provider(
+            self.storage_provider,
             low,
             low_objects,
             low_monitored,
             self.prefix.clone(),
             self.region.clone(),
         );
-        let high_est = estimate_from_usage(
+        let high_est = estimate_for_provider(
+            self.storage_provider,
             high,
             high_objects,
             high_monitored,
@@ -105,10 +115,17 @@ impl StorageEstimate {
         self.projected_bytes_high = Some(high);
         self.projected_monthly_low = Some(low_est.monthly_estimate);
         self.projected_monthly_high = Some(high_est.monthly_estimate);
+        let pricing_basis = match self.storage_provider {
+            StorageProvider::AwsS3 => {
+                "object counts scaled from the current index and the same assumed tier mix"
+            }
+            StorageProvider::BackblazeB2 => {
+                "the same flat B2 storage rate before the account's free allowance"
+            }
+        };
         self.projection_basis = format!(
-            "Rough projection: {:.0}–{:.0}% of the logical source size, with object counts scaled \
-             from the current index and the same assumed tier mix. Actual stored size depends on \
-             dedupe, compression, sparse files and APFS clones.",
+            "Rough projection: {:.0}–{:.0}% of the logical source size, with {pricing_basis}. \
+             Actual stored size depends on dedupe, compression, sparse files and APFS clones.",
             PROJECTION_LOW * 100.0,
             PROJECTION_HIGH * 100.0
         );
@@ -147,16 +164,40 @@ fn estimate_storage_current(config: &AppConfig, store: &dyn BlobStore) -> Result
                 "the blob index is missing for this backup set; run a backup to rebuild it".into(),
             ));
         }
-        return Ok(estimate_from_usage(0, 0, 0, root, config.region.clone()));
+        return Ok(estimate_for_provider(
+            config.storage_provider,
+            0,
+            0,
+            0,
+            root,
+            config.region.clone(),
+        ));
     }
     let (bytes, objects, monitored_objects) = usage_from_index(&index);
-    Ok(estimate_from_usage(
+    Ok(estimate_for_provider(
+        config.storage_provider,
         bytes,
         objects,
         monitored_objects,
         root,
         config.region.clone(),
     ))
+}
+
+fn estimate_for_provider(
+    storage_provider: StorageProvider,
+    bytes: u64,
+    objects: u64,
+    monitored_objects: u64,
+    prefix: String,
+    region: String,
+) -> StorageEstimate {
+    match storage_provider {
+        StorageProvider::AwsS3 => {
+            estimate_from_usage(bytes, objects, monitored_objects, prefix, region)
+        }
+        StorageProvider::BackblazeB2 => estimate_b2_from_usage(bytes, objects, prefix, region),
+    }
 }
 
 /// Count stored bytes and objects from the index. Pack objects are counted by
@@ -214,6 +255,7 @@ pub fn estimate_from_usage(
             + ASSUMED_ARCHIVE_INSTANT * IT_ARCHIVE_INSTANT_PER_GB_MONTH);
 
     StorageEstimate {
+        storage_provider: StorageProvider::AwsS3,
         bytes,
         objects,
         monitored_objects,
@@ -246,6 +288,43 @@ pub fn estimate_from_usage(
     }
 }
 
+/// Estimate the gross cost of keeping the indexed current objects for 30 days.
+/// B2 bills actual byte-hours. A single backup-set index cannot allocate the
+/// account-wide free allowance or reveal hidden versions, so neither adjusts
+/// this estimate. AWS tier-specific fields are zero because they do not apply.
+pub fn estimate_b2_from_usage(
+    bytes: u64,
+    objects: u64,
+    prefix: impl Into<String>,
+    region: impl Into<String>,
+) -> StorageEstimate {
+    let monthly_estimate = bytes as f64 / DECIMAL_TB * B2_PER_TB_MONTH;
+    StorageEstimate {
+        storage_provider: StorageProvider::BackblazeB2,
+        bytes,
+        objects,
+        monitored_objects: 0,
+        prefix: prefix.into(),
+        region: region.into(),
+        monthly_estimate,
+        monthly_low: monthly_estimate,
+        monthly_high: monthly_estimate,
+        monthly_frequent: 0.0,
+        monthly_infrequent: 0.0,
+        monthly_archive_instant: 0.0,
+        monthly_monitoring: 0.0,
+        assumed_tier_mix: "Always-hot B2 storage; no access tiers or per-object monitoring".into(),
+        pricing_basis: "Backblaze B2 pay-as-you-go: $6.95 per decimal TB per 30 days, USD".into(),
+        note: "Gross storage estimate from the current blob index, before the account-wide first 10 GB free allowance. Assumes these bytes remain stored for 30 days; actual B2 billing uses byte-hours. Excludes small metadata objects, hidden/noncurrent versions, data transfer, account discounts and taxes.".into(),
+        source_bytes: None,
+        projected_bytes_low: None,
+        projected_bytes_high: None,
+        projected_monthly_low: None,
+        projected_monthly_high: None,
+        projection_basis: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +354,44 @@ mod tests {
     fn small_objects_are_not_monitored() {
         let estimate = estimate_from_usage(1_000, 10, 0, "p", "eu-west-1");
         close(estimate.monthly_monitoring, 0.0);
+    }
+
+    #[test]
+    fn b2_flat_rate_uses_decimal_bytes_before_account_allowances() {
+        let estimate =
+            estimate_b2_from_usage(1_000_000_000_000, 1_000_000, "prefix/set", "us-west-004");
+        assert_eq!(estimate.storage_provider, StorageProvider::BackblazeB2);
+        close(estimate.monthly_estimate, 6.95);
+        close(estimate.monthly_low, 6.95);
+        close(estimate.monthly_high, 6.95);
+        assert_eq!(estimate.monitored_objects, 0);
+        close(estimate.monthly_monitoring, 0.0);
+        close(estimate.monthly_frequent, 0.0);
+        close(estimate.monthly_infrequent, 0.0);
+        close(estimate.monthly_archive_instant, 0.0);
+
+        let small = estimate_b2_from_usage(1_000_000_000, 1, "prefix/set", "us-west-004");
+        // The account may consume its free allowance in another bucket or set.
+        close(small.monthly_estimate, 0.00695);
+        let empty = estimate_b2_from_usage(0, 0, "prefix/set", "us-west-004");
+        close(empty.monthly_estimate, 0.0);
+    }
+
+    #[test]
+    fn b2_projection_uses_its_flat_rate_and_never_shrinks_current_usage() {
+        let mut estimate =
+            estimate_b2_from_usage(200_000_000_000, 200, "prefix/set", "us-west-004");
+        estimate.project_from_source(1_000_000_000_000);
+        assert_eq!(estimate.projected_bytes_low, Some(500_000_000_000));
+        assert_eq!(estimate.projected_bytes_high, Some(1_000_000_000_000));
+        close(estimate.projected_monthly_low.unwrap(), 3.475);
+        close(estimate.projected_monthly_high.unwrap(), 6.95);
+
+        estimate.project_from_source(10_000_000_000);
+        assert_eq!(estimate.projected_bytes_low, Some(estimate.bytes));
+        assert_eq!(estimate.projected_bytes_high, Some(estimate.bytes));
+        close(estimate.projected_monthly_low.unwrap(), 1.39);
+        close(estimate.projected_monthly_high.unwrap(), 1.39);
     }
 
     #[test]
@@ -327,6 +444,43 @@ mod tests {
         assert_eq!(estimate.monitored_objects, 0);
         assert!(estimate.projected_bytes_low.is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn b2_storage_estimate_reads_remote_index_and_projects_at_b2_rates() {
+        let uuid = uuid::Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("cost-b2-test-{uuid}"));
+        let store = LocalStore::new(&dir).unwrap();
+        let config = AppConfig {
+            storage_provider: StorageProvider::BackblazeB2,
+            endpoint: "https://s3.us-west-004.backblazeb2.com".into(),
+            bucket: "cost-test-bucket".into(),
+            region: "us-west-004".into(),
+            backup_set_uuid: uuid.to_string(),
+            ..AppConfig::default()
+        };
+        let root = config.key_root();
+        let empty = estimate_storage(&config, &store, None).unwrap();
+        assert_eq!(empty.storage_provider, StorageProvider::BackblazeB2);
+        close(empty.monthly_estimate, 0.0);
+
+        let mut index = BlobIndex::default();
+        index.add_pack("blobpacks/a".into(), 400_000_000_000);
+        index.add_blob(standalone_loc("tree", "treepacks/tree", 100_000_000_000));
+        let json = serde_json::to_vec(&index).unwrap();
+        let compressed = crate::core::compression::lz4_compress_with_prefix(&json);
+        store
+            .put(&BlobIndex::remote_key(&root), &compressed)
+            .unwrap();
+        let estimate = estimate_storage(&config, &store, Some(2_000_000_000_000)).unwrap();
+        assert_eq!(estimate.storage_provider, StorageProvider::BackblazeB2);
+        assert_eq!(estimate.bytes, 500_000_000_000);
+        assert_eq!(estimate.objects, 2);
+        assert_eq!(estimate.monitored_objects, 0);
+        close(estimate.monthly_estimate, 3.475);
+        close(estimate.projected_monthly_low.unwrap(), 6.95);
+        close(estimate.projected_monthly_high.unwrap(), 13.9);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

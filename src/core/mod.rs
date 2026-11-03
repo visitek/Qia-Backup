@@ -24,6 +24,7 @@ pub mod restore;
 pub mod retention;
 pub mod scheduler;
 pub mod secrets;
+pub mod settings;
 pub mod snapshot;
 pub mod status;
 pub mod store;

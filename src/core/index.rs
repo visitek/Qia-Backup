@@ -96,7 +96,19 @@ impl BlobIndex {
     }
 
     fn namespace(config: &AppConfig) -> String {
-        let identity = format!("{}|{}|{}", config.bucket, config.region, config.key_root());
+        // Keep AWS cache names stable while separating B2 from every AWS set.
+        let identity = match config.storage_provider {
+            crate::core::model::StorageProvider::AwsS3 => {
+                format!("{}|{}|{}", config.bucket, config.region, config.key_root())
+            }
+            crate::core::model::StorageProvider::BackblazeB2 => format!(
+                "b2|{}|{}|{}|{}",
+                config.endpoint.trim().trim_end_matches('/'),
+                config.bucket,
+                config.region,
+                config.key_root()
+            ),
+        };
         let digest = crate::core::crypto::sha256_hex(identity.as_bytes());
         format!("{}-{}", config.backup_set_uuid, &digest[..16])
     }
@@ -474,6 +486,25 @@ mod tests {
             stretch_encryption_key: false,
             compression_type: 0,
         }
+    }
+
+    #[test]
+    fn cache_identity_separates_b2_and_preserves_aws() {
+        let aws = AppConfig {
+            bucket: "bucket".into(),
+            region: "us-west-004".into(),
+            backup_set_uuid: "set".into(),
+            ..AppConfig::default()
+        };
+        let old_identity = format!("{}|{}|{}", aws.bucket, aws.region, aws.key_root());
+        let digest = crate::core::crypto::sha256_hex(old_identity.as_bytes());
+        assert_eq!(BlobIndex::namespace(&aws), format!("set-{}", &digest[..16]));
+        let b2 = AppConfig {
+            storage_provider: crate::core::model::StorageProvider::BackblazeB2,
+            endpoint: "https://s3.us-west-004.backblazeb2.com".into(),
+            ..aws.clone()
+        };
+        assert_ne!(BlobIndex::local_path(&aws), BlobIndex::local_path(&b2));
     }
 
     #[test]

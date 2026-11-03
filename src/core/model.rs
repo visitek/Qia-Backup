@@ -411,14 +411,29 @@ impl BackupRecord {
     }
 }
 
+/// S3-compatible destination. Existing configurations keep using AWS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum StorageProvider {
+    #[default]
+    AwsS3,
+    BackblazeB2,
+}
+
 /// Persistent configuration of Qia Backup (not remote backup-set metadata).
 /// backup-set metadata; this lives in the user's Library).
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppConfig {
     pub version: u32,
     pub backup_set_uuid: String,
     pub backup_set_name: String,
+    #[serde(default)]
+    pub storage_provider: StorageProvider,
+    /// B2 regional HTTPS service endpoint; empty for AWS. Never contains credentials.
+    #[serde(default)]
+    pub endpoint: String,
     pub bucket: String,
     pub region: String,
     pub prefix: String,
@@ -470,6 +485,8 @@ impl std::fmt::Debug for AppConfig {
             .field("version", &self.version)
             .field("backup_set_uuid", &self.backup_set_uuid)
             .field("backup_set_name", &self.backup_set_name)
+            .field("storage_provider", &self.storage_provider)
+            .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
             .field("region", &self.region)
             .field("prefix", &self.prefix)
@@ -660,6 +677,8 @@ impl Default for AppConfig {
             version: 1,
             backup_set_uuid: uuid::Uuid::new_v4().to_string(),
             backup_set_name: "Time Machine".to_string(),
+            storage_provider: StorageProvider::AwsS3,
+            endpoint: String::new(),
             bucket: String::new(),
             region: DEFAULT_REGION.to_string(),
             prefix: "qia-backups".to_string(),
@@ -688,6 +707,19 @@ impl Default for AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_configs_default_to_aws_and_unknown_providers_fail() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("storageProvider");
+        object.remove("endpoint");
+        let old: AppConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(old.storage_provider, StorageProvider::AwsS3);
+        assert!(old.endpoint.is_empty());
+        value["storageProvider"] = serde_json::json!("unrecognized_provider");
+        assert!(serde_json::from_value::<AppConfig>(value).is_err());
+    }
 
     #[test]
     fn debug_redacts_secrets() {

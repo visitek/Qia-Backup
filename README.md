@@ -3,8 +3,8 @@
 ![Qia Backup dashboard](intro.png)
 
 Qia Backup is a macOS backup app that captures **APFS local snapshots** (the same
-mechanism Time Machine uses locally) and stores them in **AWS S3**. **No external
-Time Machine drive is required.** The engine is Rust; the desktop UI is Tauri
+mechanism Time Machine uses locally) and stores them in **AWS S3 or Backblaze B2**.
+**No external Time Machine drive is required.** The engine is Rust; the desktop UI is Tauri
 (macOS-only).
 
 ---
@@ -61,7 +61,13 @@ Time Machine drive is required.** The engine is Rust; the desktop UI is Tauri
 - Shows live upload throughput, active/max worker counts, uploaded bytes, and a
   rolling speed sparkline while a backup runs.
 
-Only S3 is a destination. There are no Dropbox/Google/SFTP/Wasabi/etc. providers.
+Destinations use the S3 protocol: AWS S3 and Backblaze B2 are supported. The
+backup format, encryption, incremental backups, retention and restore are shared.
+The Dashboard has separate **Back up to AWS S3** and **Back up to Backblaze B2**
+buttons. Both destinations retain independent settings and backup histories. A
+provider's **View settings and backups** button selects the context for Settings,
+Files, history, restore, comparisons and estimates without starting a backup.
+An unconfigured provider opens its Settings before its first backup.
 
 ---
 
@@ -164,7 +170,7 @@ cargo build --release
 cargo install --path . --bin qia-backupctl
 ```
 
-`cargo test` runs 97 library tests plus 7 versioned format tests, including full
+`cargo test` runs library tests plus 7 versioned format tests, including full
 backup/restore, encryption, incremental dedupe, symlinks, compression, partial
 browsing and retention.
 
@@ -176,7 +182,8 @@ Credentials can come from flags, the macOS Keychain, or the standard AWS
 environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_REGION`). On macOS, `init` stores the secret access key and the encryption
 password in the login Keychain; `config.json` only keeps non-secret settings.
-The default region is `eu-west-1`.
+The default AWS region is `eu-west-1`. For B2 credentials and endpoint settings,
+see [Backblaze B2](#backblaze-b2).
 
 ```sh
 # Configure a backup set. Omit --source to use APFS local snapshots.
@@ -314,7 +321,7 @@ independent of the Mac, and keep a copy of the config if possible.
    Use **Test connection** to verify the bucket and (if enabled) the
    encryption password.
 3. **Save settings**.
-4. **Dashboard** → **Back Up Now**. Progress, files, bytes read/uploaded,
+4. **Dashboard** → **Back up to AWS S3** or **Back up to Backblaze B2**. Progress, files, bytes read/uploaded,
    upload speed, active upload workers and activity are live. The Dashboard
    also shows an estimated monthly S3 cost based on the bytes currently stored
    under this backup set. Backups pause on battery power or while the Mac
@@ -372,7 +379,98 @@ with `docs/iam-policy.json`.
 
 ---
 
-## S3 permissions
+## Backblaze B2
+
+B2 uses its [S3-compatible API](https://www.backblaze.com/docs/cloud-storage-call-the-s3-compatible-api).
+The app uses the bucket's regional HTTPS endpoint, path-style object URLs and
+SigV4 signing. For example, `https://s3.us-west-004.backblazeb2.com` must use
+region `us-west-004`. Copy your bucket's actual S3 endpoint from Backblaze; do
+not use a download URL, include the bucket name in the endpoint, or substitute
+an AWS region. TLS verification stays enabled and signed requests do not follow
+redirects. Buckets with periods in their names work with B2's path-style URLs.
+
+Create a private bucket and a dedicated **Read and Write application key**
+restricted to that bucket. Use its **keyID** as the access key ID and its
+**applicationKey** as the secret. The master application key is unsupported by
+the S3 API. The store uses `listFiles`, `readFiles` and `writeFiles`; include
+`deleteFiles` for the standard read/write/delete capability set. It performs no
+account-wide bucket listing or HeadBucket request. An optional key name-prefix
+restriction must encompass every object under the configured key prefix (for
+example `qia-backups/`). The connection test lists only the selected backup-set
+prefix and is read-only; it does not prove that uploads/deletes are permitted.
+See Backblaze's [application-key capability mapping](https://www.backblaze.com/docs/cloud-storage-s3-compatible-app-keys).
+
+In **Settings**, select the saved **Backblaze B2** destination, enter the S3 endpoint, matching region,
+bucket, prefix, key ID and application key, select included folders, then save
+and test the connection. Enable client-side encryption before the first backup
+if required, and keep the encryption password separately for recovery. On
+macOS, B2 application keys are stored separately from the existing AWS key in
+the Keychain, scoped to endpoint and key ID. Changing storage accounts requires
+entering the corresponding key. **Copy application-key requirements** provides
+the bucket, prefix and capability requirements for B2 setup. Selecting a new destination does not copy
+objects from another bucket; start a new backup there or attach to a backup
+set already present in that destination.
+
+Each provider owns its backup-set UUID, included folders, exclusions, encryption,
+retention, schedule and last-run state. Both profiles are saved atomically in one
+versioned `config.json`; an existing single destination is migrated into only its
+own provider slot with its UUID and settings preserved. Secrets remain in
+separate macOS Keychain accounts, including destination-scoped encryption
+passwords. Both automatic schedules start paused when the app launches. You can
+enable each configured provider's schedule separately; one backup, restore or
+metadata mutation runs at a time. Destination switching and settings changes
+are blocked during those operations so completion and pruning keep their
+originating bucket. Unsaved form edits remain in this app session when switching
+views and are used for a backup only after you save them.
+
+For the CLI, populate `B2_APPLICATION_KEY_ID` and `B2_APPLICATION_KEY` securely
+in your local environment, then configure the destination, for example:
+
+```sh
+qia-backupctl init \
+  --provider backblaze_b2 \
+  --endpoint https://s3.us-west-004.backblazeb2.com \
+  --region us-west-004 \
+  --bucket my-private-backup-bucket \
+  --prefix qia-backups \
+  --source "/path/to/selected/folder" \
+  --schedule 0
+
+qia-backupctl test
+qia-backupctl backup
+qia-backupctl restore --dest "/path/to/restore-check"
+```
+
+The source above is a folder; omit `--source` and provide `--include` folders
+for APFS snapshot mode. The existing CLI `--password` option configures
+client-side encryption. `B2_ENDPOINT` and `B2_REGION` can supply B2 endpoint and
+region; explicit flags take precedence. B2 never reads AWS credential variables.
+The remaining commands, including list, diff, prune and restore, use the saved
+provider automatically. `init --provider` and `backup --provider` select that
+provider's saved profile without replacing the other one. For recovery on another machine, supply the same B2
+endpoint/region/bucket/prefix, backup-set UUID and encryption password.
+
+B2 keeps old object versions. Qia's pruning and Delete backup set hide current
+objects; historical bytes remain billed until a separately configured
+[lifecycle rule](https://www.backblaze.com/docs/cloud-storage-lifecycle-rules)
+expires hidden/noncurrent versions. Do **not** expire current backup objects
+merely by their upload age: recent backups can still reference older deduplicated
+blobs. The app does not manage lifecycle rules or Object Lock; retained/locked
+objects can prevent cleanup. The Dashboard estimates indexed current B2 storage
+at $6.95 per decimal TB per 30 days, before account-wide free storage allowances,
+and projects the final storage range from source size. Actual billing is by
+byte-hour and also reflects metadata, hidden versions, transfers, discounts and
+taxes excluded from this estimate. Check [Backblaze pricing](https://www.backblaze.com/cloud-storage/pricing)
+and the console for actual usage and retained versions.
+
+Use one writer per backup set. Backblaze documents a one-second ordering limit
+for successive uploads/hides of the same key. The adapter spaces PUT/DELETE
+attempts to the same object by at least 1.1 seconds, including retries and new
+store instances within the same process. Unrelated keys can upload concurrently;
+separate processes or other clients are not coordinated. See Backblaze's
+[successive-call behavior](https://www.backblaze.com/docs/cloud-storage-call-the-s3-compatible-api).
+
+## AWS S3 permissions
 
 `docs/iam-policy.json` grants only:
 
@@ -380,8 +478,8 @@ with `docs/iam-policy.json`.
 - `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` on
   `YOUR_BUCKET/YOUR_PREFIX/*`
 
-The app uses virtual-hosted-style requests to the AWS S3 endpoint. It does not
-create or update the bucket and does not require bucket-level
+For AWS, the app uses virtual-hosted-style requests to the regional S3 endpoint.
+It does not create or update the bucket and does not require bucket-level
 create/delete/list-all permissions.
 
 Once the bucket is filled in Settings, **Copy IAM policy** copies this policy
@@ -575,7 +673,22 @@ cargo test
 ```
 
 The tests use a local filesystem `BlobStore`, and SigV4 signing is covered by a
-reference-vector unit test. No AWS credentials are needed.
+reference-vector unit test. The default suite needs no cloud credentials.
+
+`tests/backblaze_b2.rs` contains an ignored test against a **dedicated B2 test
+bucket**, using only synthetic files under a generated UUID prefix. It covers
+object/range/list/delete operations, encrypted full and incremental backups, and
+byte-for-byte restore of both revisions. Its module documents the required
+`QIA_B2_TEST_*` variables. After configuring scoped test credentials and explicitly
+authorizing those test uploads/deletions with `QIA_B2_TEST_ALLOW_WRITE=1`, run:
+
+```sh
+cargo test --locked --test backblaze_b2 -- --ignored --nocapture
+```
+
+The test removes current objects only within its generated prefix. Historical
+B2 versions require the test bucket's lifecycle policy. A successful default
+local test run does not establish live B2 compatibility.
 
 ---
 

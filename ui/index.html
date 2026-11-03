@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="Qia Backup — APFS local snapshot backups to AWS S3." />
+  <meta name="description" content="Qia Backup — APFS local snapshot backups to AWS S3 or Backblaze B2." />
   <title>Qia Backup — Time Machine to S3</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -64,7 +64,7 @@
       <header class="topbar">
         <div>
           <h2 id="view-title">Dashboard</h2>
-          <p id="view-subtitle">Your Time Machine snapshots, safely in AWS S3.</p>
+          <p id="view-subtitle">Your Time Machine snapshots, safely in cloud storage.</p>
         </div>
         <div class="status-area">
           <div class="status-pill idle" id="status-pill">
@@ -78,6 +78,21 @@
 
       <!-- Dashboard -->
       <section class="view active" id="view-dashboard">
+        <div class="destination-grid" aria-label="Saved cloud destinations">
+          <article class="destination-card card" id="destination-aws">
+            <div class="destination-heading"><h3>AWS S3</h3><span class="chip" id="destination-aws-state">Not configured</span></div>
+            <p class="muted small" id="destination-aws-bucket">Save an AWS bucket in Settings.</p>
+            <button class="button primary" id="backup-aws" type="button">Back up to AWS S3</button>
+            <button class="link-button" id="select-aws" type="button" aria-pressed="false">View AWS settings and backups</button>
+          </article>
+          <article class="destination-card card" id="destination-b2">
+            <div class="destination-heading"><h3>Backblaze B2</h3><span class="chip" id="destination-b2-state">Not configured</span></div>
+            <p class="muted small" id="destination-b2-bucket">Save a B2 bucket in Settings.</p>
+            <button class="button primary" id="backup-b2" type="button">Back up to Backblaze B2</button>
+            <button class="link-button" id="select-b2" type="button" aria-pressed="false">View B2 settings and backups</button>
+          </article>
+        </div>
+        <p class="muted small" id="destination-context">Viewing AWS S3. History, files, settings and estimates follow this destination.</p>
         <div class="hero card">
           <div class="hero-main">
             <div class="eyebrow">Destination</div>
@@ -91,7 +106,6 @@
           </div>
           <div class="hero-actions">
             <button class="button" id="toggle-auto" title="Automatic backups start paused when the app launches">Auto: Paused</button>
-            <button class="button primary" id="backup-now">Back Up Now</button>
             <button class="button danger hidden" id="cancel-run">Cancel</button>
           </div>
         </div>
@@ -153,7 +167,7 @@
 
         <div class="cost-card card" id="cost-card">
           <div class="cost-main">
-            <span class="stat-label">Estimated S3 cost</span>
+            <span class="stat-label" id="cost-label">Estimated storage cost</span>
             <span class="cost-value" id="cost-value">—</span>
             <span class="cost-sub" id="cost-sub">Calculated from the stored backup set.</span>
           </div>
@@ -282,29 +296,44 @@
       <section class="view" id="view-settings">
         <form id="settings-form" autocomplete="off">
           <div class="card">
-            <div class="card-head"><h3>AWS S3 destination</h3><span class="chip">Required</span></div>
+            <div class="card-head"><h3>Cloud destination</h3><span class="chip">Required</span></div>
             <div class="form-grid">
+              <div class="field span2">
+                <label for="storage-provider">Saved destination</label>
+                <select id="storage-provider">
+                  <option value="aws_s3">AWS S3</option>
+                  <option value="backblaze_b2">Backblaze B2</option>
+                </select>
+                <span class="hint">AWS and B2 keep separate settings, source folders, encryption, schedules and backup history. Unsaved edits stay in this app session when you switch.</span>
+              </div>
               <div class="field span2">
                 <label for="bucket">Bucket</label>
                 <input id="bucket" type="text" spellcheck="false" placeholder="my-time-machine-backups" />
               </div>
+              <div class="field span2 hidden" id="endpoint-field">
+                <label for="endpoint">S3 endpoint</label>
+                <input id="endpoint" type="text" spellcheck="false" placeholder="https://s3.us-west-004.backblazeb2.com" aria-describedby="endpoint-hint" />
+                <span class="hint" id="endpoint-hint">Copy the bucket's S3 endpoint from Backblaze and include https://. Use only the endpoint host, without the bucket name or a path.</span>
+              </div>
               <div class="field">
                 <label for="region">Region</label>
-                <input id="region" type="text" spellcheck="false" placeholder="eu-west-1" />
+                <input id="region" type="text" spellcheck="false" placeholder="eu-west-1" aria-describedby="region-hint" />
+                <span class="hint" id="region-hint">Use the AWS region containing this bucket.</span>
               </div>
               <div class="field">
                 <label for="prefix">Key prefix</label>
                 <input id="prefix" type="text" spellcheck="false" placeholder="qia-backups" />
               </div>
               <div class="field">
-                <label for="access-key">Access key ID</label>
+                <label for="access-key" id="access-key-label">Access key ID</label>
                 <input id="access-key" type="text" spellcheck="false" />
               </div>
               <div class="field">
-                <label for="secret-key">Secret access key <span class="hint">stored in macOS Keychain</span></label>
+                <label for="secret-key"><span id="secret-key-label">Secret access key</span> <span class="hint">stored in macOS Keychain</span></label>
                 <input id="secret-key" type="password" placeholder="Leave blank to keep the saved key" />
               </div>
             </div>
+            <p class="muted small hidden" id="b2-setup-hint">Use a dedicated Backblaze Read and Write application key restricted to this bucket. The master application key cannot use the S3 API. Backblaze retains older file versions after pruning; configure lifecycle rules to expire hidden versions if needed. Do not expire current backup objects by age, because newer backups may still reference them.</p>
             <details class="advanced-setting">
               <summary>Attach to an existing backup set</summary>
               <div class="field">
@@ -319,6 +348,7 @@
             <div class="inline-actions">
               <button type="button" class="button" id="test-connection">Test connection</button>
               <button type="button" class="button" id="copy-iam-policy" disabled title="Fill in the bucket to enable this">Copy IAM policy</button>
+              <button type="button" class="button hidden" id="copy-b2-requirements">Copy application-key requirements</button>
               <span class="test-result" id="test-result"></span>
             </div>
           </div>

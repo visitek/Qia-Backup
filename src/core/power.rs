@@ -85,7 +85,12 @@ impl PowerPolicy {
             return None;
         }
         let since = self.stable_since?;
-        Some(self.stable_window.saturating_sub(now.duration_since(since)))
+        let elapsed = now.duration_since(since);
+        if elapsed >= self.stable_window {
+            None
+        } else {
+            Some(self.stable_window - elapsed)
+        }
     }
 
     /// Human-readable reason why backups are paused, or `None` when they may
@@ -132,6 +137,29 @@ mod tests {
         assert!(!policy.can_run(now + Duration::from_secs(10)));
         assert!(!policy.can_run(now + Duration::from_secs(309)));
         assert!(policy.can_run(now + Duration::from_secs(310)));
+    }
+
+    #[test]
+    fn stable_power_hint_clears_at_the_run_boundary() {
+        let now = Instant::now();
+        let window = Duration::from_secs(300);
+        let mut policy = PowerPolicy::new_with_window(now, window);
+        policy.set_on_battery(true, now);
+        let connected = now + Duration::from_secs(10);
+        policy.set_on_battery(false, connected);
+        let ready = connected + window;
+        let before = ready - Duration::from_nanos(1);
+        assert!(!policy.can_run(before));
+        assert_eq!(
+            policy.stable_remaining(before),
+            Some(Duration::from_nanos(1))
+        );
+        assert!(policy.message(before).is_some());
+        for instant in [ready, ready + Duration::from_nanos(1)] {
+            assert!(policy.can_run(instant));
+            assert_eq!(policy.stable_remaining(instant), None);
+            assert_eq!(policy.message(instant), None);
+        }
     }
 
     #[test]
