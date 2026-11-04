@@ -125,8 +125,6 @@ const state = {
   storageEstimate: null,
   estimateAt: 0,
   estimateError: "",
-  progressStart: null,
-  progressRun: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -188,38 +186,58 @@ function fmtFileProgress(s) {
   return total > 0 ? `${done} / ~${total.toLocaleString()} files` : `${done} files`;
 }
 
-// Use the average file rate since scanning started rather than a short
-// rolling window. Short windows make the ETA jump wildly when a large file or
-// a slow directory is encountered.
+function parseTime(value) {
+  let timestamp = Date.parse(String(value || ""));
+  if (!Number.isFinite(timestamp)) {
+    // Some WebKit versions reject chrono's nanosecond fraction.
+    timestamp = Date.parse(String(value || "").replace(/\.\d+/, ""));
+  }
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+// Estimate from bytes, not file counts. A backup can finish most of its files
+// while most of its bytes (and nearly all of its upload time) are still ahead,
+// so a file-based ETA looks reasonable for hours and then keeps sliding.
+//
+// The scan is backpressured by the upload budget, so its throughput in source
+// bytes already reflects compression, deduplication and the upload rate limit.
+// Measuring the average since the run started (rather than since this view
+// opened) also keeps the estimate stable across UI reloads.
 function sampleProgress(s) {
-  const total = Number(s?.totalFiles || 0);
-  const done = Number(s?.files || 0);
-  const active = !!s?.running && !s?.restoring && !s?.cancelRequested
-    && total > 0 && done > 0 && done < total;
-  if (!active) {
-    if (!s?.running) {
-      state.progressStart = null;
-      state.progressRun = null;
-    }
-    return null;
-  }
-  const runKey = s.startedAt || "";
-  if (state.progressRun !== runKey) {
-    state.progressRun = runKey;
-    state.progressStart = null;
-  }
-  const now = Date.now();
-  if (!state.progressStart || done < state.progressStart.files) {
-    state.progressStart = { t: now, files: done };
-    return null;
-  }
-  const elapsed = (now - state.progressStart.t) / 1000;
-  const processed = done - state.progressStart.files;
+  const active = !!s?.running && !s?.restoring && !s?.cancelRequested;
+  if (!active) return null;
+  const started = parseTime(s?.startedAt);
+  if (started == null) return null;
+  const elapsed = (Date.now() - started) / 1000;
   // Wait for a meaningful sample before showing an estimate.
-  if (elapsed < 10 || processed < 50) return null;
-  const rate = processed / elapsed;
+  if (elapsed < 10) return null;
+
+  const totalBytes = Number(s?.totalBytes || 0);
+  const scanned = Number(s?.bytesScanned || 0);
+  if (totalBytes > 0 && scanned > 0) {
+    const remaining = totalBytes - scanned;
+    if (remaining > 0) {
+      const rate = scanned / elapsed;
+      if (Number.isFinite(rate) && rate > 0) {
+        return {
+          seconds: remaining / rate,
+          detail: `${fmtSpeed(rate)} read · ${fmtBytes(remaining)} of ~${fmtBytes(totalBytes)} left`,
+        };
+      }
+    }
+    // Every byte has been read; only the upload queue remains. Fall through
+    // to the file estimate, which is null once every file is counted too.
+  }
+
+  const totalFiles = Number(s?.totalFiles || 0);
+  const doneFiles = Number(s?.files || 0);
+  if (totalFiles <= 0 || doneFiles <= 0 || doneFiles >= totalFiles) return null;
+  const rate = doneFiles / elapsed;
   if (!Number.isFinite(rate) || rate <= 0) return null;
-  return { seconds: (total - done) / rate, rate };
+  return {
+    seconds: (totalFiles - doneFiles) / rate,
+    detail: `${Math.round(rate).toLocaleString()} files/s · ${(totalFiles - doneFiles).toLocaleString()} files left`,
+  };
 }
 
 function fmtEta(seconds) {
@@ -808,9 +826,7 @@ function updateStatus() {
     const pct = progress == null ? null : progress * 100;
     const eta = sampleProgress(s);
     $("progress-eta").textContent = eta ? fmtEta(eta.seconds) : "";
-    $("progress-eta").title = eta
-      ? `${Math.round(eta.rate).toLocaleString()} files/s average since scanning started`
-      : "";
+    $("progress-eta").title = eta ? `${eta.detail} · average since the run started` : "";
     const counting = pct == null && String(s.phase || "").toLowerCase() === "counting";
     if (counting) {
       // The denominator is still being discovered; avoid showing a
