@@ -438,6 +438,11 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
         CancelToken::new(),
         &mut |event| match event {
             ProgressEvent::Phase { name, detail } => println!("[{name}] {detail}"),
+            ProgressEvent::Activity { text } => {
+                if verbose {
+                    println!("  {text}");
+                }
+            }
             ProgressEvent::Totals { files, bytes } => {
                 total_files = files;
                 if verbose && (files > 0 || bytes > 0) {

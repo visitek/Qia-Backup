@@ -5,6 +5,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::engine::BackupSummary;
 
+/// Number of activities shown before the user expands the feed.
+pub const ACTIVITY_VISIBLE_LIMIT: usize = 5;
+/// Total distinct activities retained for the expanded feed (5 + 20 more).
+pub const ACTIVITY_HISTORY_LIMIT: usize = 25;
+
+/// A timestamped, human-readable description of a fine-grained engine action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntry {
+    pub at: DateTime<Utc>,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStatus {
@@ -73,6 +86,11 @@ pub struct AppStatus {
     /// Explanation shown while backups are gated by power conditions.
     #[serde(default)]
     pub power_message: String,
+    /// Last few distinct engine actions, oldest first. Used by the dashboard
+    /// activity box so a run that is quiet (for example while reading one huge
+    /// file) still has a visible heartbeat.
+    #[serde(default)]
+    pub recent_activity: Vec<ActivityEntry>,
 }
 
 impl AppStatus {
@@ -103,6 +121,7 @@ impl AppStatus {
         self.upload_per_worker_bps = 0;
         self.upload_utilization = 0.0;
         self.power_paused = false;
+        self.recent_activity.clear();
     }
 
     pub fn fail(&mut self, message: impl Into<String>) {
@@ -115,6 +134,28 @@ impl AppStatus {
         self.upload_in_flight = 0;
         self.upload_per_worker_bps = 0;
         self.upload_utilization = 0.0;
+        self.recent_activity.clear();
+    }
+
+    /// Record an engine action for the live activity box. Repeated identical
+    /// actions refresh the existing entry instead of filling the feed with
+    /// duplicates, so a long-running heartbeat stays visible without crowding
+    /// out other distinct work.
+    pub fn record_activity(&mut self, text: impl Into<String>) {
+        self.record_activity_at(Utc::now(), text);
+    }
+
+    pub fn record_activity_at(&mut self, at: DateTime<Utc>, text: impl Into<String>) {
+        let text = text.into().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.recent_activity.retain(|entry| entry.text != text);
+        self.recent_activity.push(ActivityEntry { at, text });
+        if self.recent_activity.len() > ACTIVITY_HISTORY_LIMIT {
+            let excess = self.recent_activity.len() - ACTIVITY_HISTORY_LIMIT;
+            self.recent_activity.drain(0..excess);
+        }
     }
 }
 
@@ -358,5 +399,75 @@ mod transfer_tests {
         let sample = meter.sample(Instant::now());
         assert_eq!(sample.bytes, 0);
         assert_eq!(sample.worker_seconds, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn texts(status: &AppStatus) -> Vec<&str> {
+        status
+            .recent_activity
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn keeps_the_latest_history_for_the_expanded_feed() {
+        let base = Utc::now();
+        let mut status = AppStatus::default();
+        for i in 0..(ACTIVITY_HISTORY_LIMIT + 5) {
+            status.record_activity_at(
+                base + Duration::seconds(i as i64),
+                format!("activity number {i}"),
+            );
+        }
+        assert_eq!(status.recent_activity.len(), ACTIVITY_HISTORY_LIMIT);
+        assert_eq!(status.recent_activity[0].text, "activity number 5");
+        assert_eq!(
+            status.recent_activity.last().unwrap().text,
+            format!("activity number {}", ACTIVITY_HISTORY_LIMIT + 4)
+        );
+        assert!(
+            ACTIVITY_HISTORY_LIMIT >= ACTIVITY_VISIBLE_LIMIT + 20,
+            "the history must be able to hold 5 visible plus 20 expanded entries"
+        );
+    }
+
+    #[test]
+    fn repeated_activity_refreshes_instead_of_duplicating() {
+        let base = Utc::now();
+        let mut status = AppStatus::default();
+        status.record_activity_at(base, "Reading huge.dmg");
+        status.record_activity_at(base + Duration::seconds(1), "Uploading pack");
+        status.record_activity_at(base + Duration::seconds(2), "Reading huge.dmg");
+        assert_eq!(texts(&status), vec!["Uploading pack", "Reading huge.dmg"]);
+        assert_eq!(
+            status.recent_activity.last().unwrap().at,
+            base + Duration::seconds(2)
+        );
+    }
+
+    #[test]
+    fn older_activities_stay_available_for_the_expanded_feed() {
+        let base = Utc::now();
+        let mut status = AppStatus::default();
+        status.record_activity_at(base, "old activity");
+        status.record_activity_at(base + Duration::seconds(60), "new activity");
+        assert_eq!(texts(&status), vec!["old activity", "new activity"]);
+    }
+
+    #[test]
+    fn empty_activity_is_ignored_and_begin_clears_the_feed() {
+        let base = Utc::now();
+        let mut status = AppStatus::default();
+        status.record_activity_at(base, "   ");
+        assert!(status.recent_activity.is_empty());
+        status.record_activity_at(base, "working");
+        status.begin("scanning", "source");
+        assert!(status.recent_activity.is_empty());
     }
 }

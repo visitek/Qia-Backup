@@ -87,6 +87,9 @@ const SCAN_PROBE_COOLDOWN: Duration = Duration::from_secs(10);
 const SCAN_PROBE_RETENTION: f64 = 0.85;
 /// Only probe upward while scanned data keeps the active workers busy.
 const SCAN_UTILIZATION_MIN: f64 = 0.5;
+/// Minimum spacing between activity heartbeats. This keeps a long single-file
+/// read visible without flooding the recent-activity history.
+const ACTIVITY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
 pub struct CancelToken {
@@ -140,6 +143,12 @@ pub enum ProgressEvent {
     Phase {
         name: String,
         detail: String,
+    },
+    /// A fine-grained, human-readable description of what the engine is doing
+    /// right now. Unlike `Phase`, these are emitted often enough to provide a
+    /// heartbeat while a single file or upload takes a long time.
+    Activity {
+        text: String,
     },
     File {
         files: u64,
@@ -539,6 +548,21 @@ fn parent_rel(rel: &str) -> String {
     }
 }
 
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn collect_xattrs(path: &Path, symlink_target: Option<&Path>) -> Result<Option<Vec<u8>>> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     if let Ok(names) = xattr::list(path) {
@@ -814,6 +838,10 @@ impl<'a> BackupEngine<'a> {
             name: name.to_string(),
             detail: detail.into(),
         });
+    }
+
+    fn activity(&mut self, text: impl Into<String>) {
+        (self.progress)(ProgressEvent::Activity { text: text.into() });
     }
 
     fn add_error(
@@ -1384,6 +1412,7 @@ impl<'a> BackupEngine<'a> {
                     self.handle_upload_done(done);
                 }
             }
+            self.activity("Saving progress checkpoint");
             self.checkpoint_index()?;
         }
         Ok(())
@@ -1624,10 +1653,13 @@ impl<'a> BackupEngine<'a> {
             if remaining.is_empty() {
                 break;
             }
-            let outcome = self.scan_mut()?.rx.recv();
+            let outcome = self.scan_mut()?.rx.recv_timeout(ACTIVITY_INTERVAL);
             match outcome {
                 Ok(outcome) => self.finish_scan_outcome(outcome)?,
-                Err(_) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.report_scan_wait(ids);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(BackupError::Other(
                         "scan workers stopped unexpectedly".into(),
                     ));
@@ -1636,6 +1668,43 @@ impl<'a> BackupEngine<'a> {
             self.tick_scan_tuner()?;
         }
         Ok(())
+    }
+
+    /// A scan worker only reports when a whole file is prepared. While a large
+    /// file is being read and compressed, this heartbeat names the files the
+    /// walk thread is still waiting for.
+    fn report_scan_wait(&mut self, ids: &[u64]) {
+        let text = {
+            let Some(scan) = self.scan.as_ref() else {
+                return;
+            };
+            let mut pending: Vec<(&str, u64)> = ids
+                .iter()
+                .filter_map(|id| {
+                    scan.pending
+                        .get(id)
+                        .map(|item| (item.rel.as_str(), item.estimated))
+                })
+                .collect();
+            if pending.is_empty() {
+                return;
+            }
+            pending.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: u64 = pending.iter().map(|(_, size)| *size).sum();
+            let (first, size) = pending[0];
+            if pending.len() == 1 {
+                format!("Reading {first} ({})", human_bytes(size))
+            } else {
+                format!(
+                    "Reading {first} ({}) and {} more file{} ({} total)",
+                    human_bytes(size),
+                    pending.len() - 1,
+                    if pending.len() == 2 { "" } else { "s" },
+                    human_bytes(total),
+                )
+            }
+        };
+        self.activity(text);
     }
 
     fn backup_file(
@@ -1679,12 +1748,20 @@ impl<'a> BackupEngine<'a> {
         let cfg = ChunkerConfig::for_target(self.config.chunk_size);
         let mut chunker = Chunker::new(cfg);
         let mut buf = vec![0u8; 1024 * 1024];
+        let size = meta.size();
+        let large_file = size > MAX_PARALLEL_FILE_BYTES;
+        let mut file_bytes = 0u64;
+        let mut last_activity = Instant::now();
+        if large_file {
+            self.activity(format!("Reading {rel} ({})", human_bytes(size)));
+        }
         loop {
             self.cancel.check()?;
             let n = file.read(&mut buf).at(abs)?;
             if n == 0 {
                 break;
             }
+            file_bytes = file_bytes.saturating_add(n as u64);
             self.stats.bytes_scanned += n as u64;
             self.bytes_since_checkpoint += n as u64;
             let data = &buf[..n];
@@ -1693,6 +1770,15 @@ impl<'a> BackupEngine<'a> {
                 node.data_blob_locs.push(loc);
                 Ok(())
             })?;
+            if large_file && last_activity.elapsed() >= ACTIVITY_INTERVAL {
+                let pct = (file_bytes as f64 / size.max(1) as f64 * 100.0).min(100.0);
+                self.activity(format!(
+                    "Reading {rel} — {} of {} ({pct:.0}%)",
+                    human_bytes(file_bytes),
+                    human_bytes(size),
+                ));
+                last_activity = Instant::now();
+            }
             // Checkpoint mid-file so a multi-hour single file (disk image,
             // video) still makes durable progress.
             self.maybe_checkpoint()?;
@@ -1702,6 +1788,9 @@ impl<'a> BackupEngine<'a> {
             node.data_blob_locs.push(loc);
             Ok(())
         })?;
+        if large_file {
+            self.activity(format!("Finished reading {rel} ({})", human_bytes(size)));
+        }
         // item_size must reflect the actual stored file size.
         node.item_size = meta.size();
 
@@ -1795,8 +1884,19 @@ impl<'a> BackupEngine<'a> {
         let mut children: Vec<(String, Node)> = Vec::new();
         let mut contained_files = 0u64;
         let mut scan_jobs: Vec<(u64, String)> = Vec::new();
+        let entry_count = entries.len();
+        let mut processed = 0usize;
+        let mut last_activity = Instant::now();
         for (name, path) in entries {
             self.cancel.check()?;
+            processed += 1;
+            if last_activity.elapsed() >= ACTIVITY_INTERVAL {
+                let folder = if rel.is_empty() { "/" } else { rel };
+                self.activity(format!(
+                    "Scanning {folder} — {processed}/{entry_count} entries"
+                ));
+                last_activity = Instant::now();
+            }
             let child_rel = if rel.is_empty() {
                 name.clone()
             } else {
@@ -1924,16 +2024,19 @@ impl<'a> BackupEngine<'a> {
         BlobIndex,
         Option<ObjectEncryptor>,
     )> {
+        self.activity("Writing the final upload pack");
         if let Err(e) = self.flush_pack() {
             self.preserve_progress();
             return Err(e);
         }
         // The final base index may only reference objects that are actually in
         // S3, so wait for every upload before writing it.
+        self.activity("Waiting for the remaining uploads");
         if let Err(e) = self.drain_uploads() {
             self.preserve_progress();
             return Err(e);
         }
+        self.activity("Saving the backup index");
         if let Err(e) = self
             .index
             .save_and_clear(self.store, &self.root, self.config)
@@ -2325,6 +2428,9 @@ pub fn run_backup_with_partial(
     // Fail fast on credentials/keyset before prompting for admin rights.
     let keys = load_or_create_keys(config, store, &root)?;
 
+    progress(ProgressEvent::Activity {
+        text: "Loading the backup index".into(),
+    });
     let mut index = match BlobIndex::load(store, &root, config) {
         Ok(index) => index,
         Err(BackupError::Store(message)) => {
@@ -2584,6 +2690,9 @@ pub fn run_backup_with_partial(
         record.included_folders = included_folders.clone();
 
         let (record_key, _epoch) = ensure_record_key(store, &root, &config.backup_set_uuid)?;
+        (progress)(ProgressEvent::Activity {
+            text: "Writing the backup record".into(),
+        });
         let record_bytes = record::encode_record(&record, record_encryptor.as_mut())?;
         store.put(&record_key, &record_bytes)?;
         // The completed record now supersedes the live partial tree.
@@ -2715,6 +2824,13 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, ProgressEvent::Finished { .. })));
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProgressEvent::Activity { text } if text == "Loading the backup index"
+            )),
+            "backup should report fine-grained activity while preparing"
+        );
         assert!(
             events.iter().any(|e| matches!(
                 e,

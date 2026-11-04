@@ -113,6 +113,8 @@ const state = {
   confirmResolve: null,
   speedHistory: [],
   lastSpeedSampleAt: 0,
+  lastActivityRenderAt: 0,
+  activityExpanded: false,
   storageEstimate: null,
   estimateAt: 0,
   estimateError: "",
@@ -658,6 +660,74 @@ function renderTransfer(s) {
   }
 }
 
+function activityAge(at) {
+  const text = String(at || "");
+  let timestamp = Date.parse(text);
+  if (!Number.isFinite(timestamp)) {
+    // Some WebKit versions reject chrono's nanosecond fraction.
+    timestamp = Date.parse(text.replace(/\.\d+/, ""));
+  }
+  if (!Number.isFinite(timestamp)) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 1) return "now";
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h`;
+}
+
+function renderActivity(s, force = false) {
+  const card = $("activity-card");
+  if (!card) return;
+  const running = !!s?.running && !s?.restoring;
+  if (!running) {
+    card.classList.add("hidden");
+    state.activityExpanded = false;
+    return;
+  }
+  card.classList.remove("hidden");
+  // Intentionally slower than the 1.5s status poll: the feed is a calm,
+  // readable record rather than another rapidly changing number.
+  const now = Date.now();
+  if (!force && now - state.lastActivityRenderAt < 2000) return;
+  state.lastActivityRenderAt = now;
+  const phase = String(s.phase || "").trim();
+  const detail = String(s.detail || "").trim();
+  const entries = Array.isArray(s.recentActivity) ? s.recentActivity.slice().reverse() : [];
+  const latest = entries[0];
+  $("activity-current").textContent = latest?.text
+    || detail
+    || (phase ? `${phase}…` : "Working…");
+  $("activity-current-age").textContent = latest ? activityAge(latest.at) : "";
+  const older = entries.slice(1);
+  const collapsedCount = 4;
+  const visibleOlder = state.activityExpanded ? older : older.slice(0, collapsedCount);
+  const canExpand = older.length > collapsedCount;
+  const toggle = $("activity-toggle");
+  const more = $("activity-more");
+  if (more) more.classList.toggle("hidden", !canExpand);
+  if (toggle) {
+    toggle.textContent = state.activityExpanded
+      ? "Show less"
+      : `Show ${Math.min(older.length - collapsedCount, 20)} more`;
+    toggle.setAttribute("aria-expanded", String(state.activityExpanded));
+  }
+  const list = $("activity-list");
+  if (visibleOlder.length) {
+    list.innerHTML = visibleOlder.map((entry) => {
+      const age = activityAge(entry.at);
+      return `<li><span class="activity-time">${esc(age)}</span><span class="activity-text">${esc(entry.text)}</span></li>`;
+    }).join("");
+    list.classList.remove("hidden");
+  } else if (!latest) {
+    list.innerHTML = '<li class="activity-empty">No activity reported yet. The engine may be waiting on the network or filesystem.</li>';
+    list.classList.remove("hidden");
+  } else {
+    list.innerHTML = "";
+    list.classList.add("hidden");
+  }
+}
+
 function updatePowerPause() {
   const el = $("power-pause");
   if (!el) return;
@@ -766,6 +836,7 @@ function updateStatus() {
       bar.title = `${fmtFileProgress(s)} (estimated from the previous backup)`;
     }
   }
+  renderActivity(s);
   updatePowerPause();
   updateFilesNote();
   updateDashboard();
@@ -779,6 +850,8 @@ function updateStatus() {
     // Make the empty history state explain the run that is in progress.
     state.speedHistory = [];
     state.lastSpeedSampleAt = 0;
+    state.lastActivityRenderAt = 0;
+    state.activityExpanded = false;
     renderTransferSpark();
     renderBackups();
   }
@@ -2106,6 +2179,10 @@ function bind() {
   });
   document.querySelectorAll("[data-goto]").forEach((btn) => {
     btn.addEventListener("click", () => showView(btn.dataset.goto));
+  });
+  $("activity-toggle").addEventListener("click", () => {
+    state.activityExpanded = !state.activityExpanded;
+    renderActivity(state.status || {}, true);
   });
   $("bucket").addEventListener("input", updateIamPolicyButton);
   $("add-included-folder").addEventListener("click", () => pickBackupPath("folder", "include"));

@@ -130,6 +130,24 @@
           </div>
         </div>
 
+        <div class="activity-card card hidden" id="activity-card">
+          <div class="activity-head">
+            <div class="activity-heading">
+              <div class="activity-title">Engine activity</div>
+              <div class="activity-current">
+                <span class="activity-current-label">Now</span>
+                <span id="activity-current">Waiting for the engine…</span>
+                <span class="activity-current-age" id="activity-current-age"></span>
+              </div>
+            </div>
+            <span class="activity-refresh" title="Refreshes every 2 seconds. Shows the last 5 engine activities; expand for 20 more.">live · 2s</span>
+          </div>
+          <ul class="activity-list" id="activity-list"></ul>
+          <div class="activity-more hidden" id="activity-more">
+            <button class="link-button activity-toggle" id="activity-toggle" type="button" aria-expanded="false">Show 20 more</button>
+          </div>
+        </div>
+
         <div class="power-pause card hidden" id="power-pause">
           <div class="power-pause-copy">
             <strong>Backups paused</strong>

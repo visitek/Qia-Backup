@@ -109,6 +109,10 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+fn short_object_name(key: &str) -> &str {
+    key.rsplit('/').next().unwrap_or(key)
+}
+
 fn tray_status(status: &AppStatus) -> (Option<String>, String, String) {
     if status.restoring {
         let progress = if status.total_files > 0 {
@@ -825,6 +829,7 @@ fn start_backup_inner(
                     status.running = false;
                     status.phase = "idle".into();
                     status.detail = String::new();
+                    status.recent_activity.clear();
                     status.last_summary = Some(summary_for_status.clone());
                     status.last_finished_at = Some(summary.finished_at);
                     status.cancel_requested = false;
@@ -930,6 +935,15 @@ fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
                 status.phase = name.clone();
                 status.detail = detail.clone();
             }
+            let text = if detail.trim().is_empty() {
+                name.clone()
+            } else {
+                format!("{name}: {detail}")
+            };
+            status.record_activity(text);
+        }
+        ProgressEvent::Activity { text } => {
+            status.record_activity(text.clone());
         }
         ProgressEvent::File {
             files,
@@ -939,8 +953,13 @@ fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
             status.files = *files;
             status.bytes_scanned = *bytes_scanned;
         }
-        ProgressEvent::Upload { bytes, .. } => {
+        ProgressEvent::Upload { bytes, key, .. } => {
             status.bytes_uploaded += *bytes;
+            status.record_activity(format!(
+                "Uploaded {} ({})",
+                short_object_name(key),
+                human_bytes(*bytes)
+            ));
         }
         ProgressEvent::Transfer {
             speed_bps,
@@ -957,6 +976,19 @@ fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
             status.upload_target_threads = *target_threads;
             status.upload_max_threads = *max_threads;
             status.upload_in_flight = *in_flight;
+            if *in_flight > 0 {
+                let mut text = format!(
+                    "Uploading {} object{}",
+                    in_flight,
+                    if *in_flight == 1 { "" } else { "s" }
+                );
+                if *speed_bps > 0 {
+                    text.push_str(&format!(" at {}", human_bytes(*speed_bps)));
+                }
+                status.record_activity(text);
+            } else if *speed_bps > 0 {
+                status.record_activity(format!("Finishing uploads at {}", human_bytes(*speed_bps)));
+            }
         }
         ProgressEvent::Totals { files, bytes } => {
             status.total_files = *files;
