@@ -104,6 +104,13 @@ pub trait BlobStore: Send + Sync {
     }
 
     fn describe(&self) -> String;
+
+    /// Shared upload limiter attached to this store, if any. The upload pool
+    /// uses it to report the real aggregate wire rate instead of estimating it
+    /// from per-worker samples (which over-reports when concurrency changes).
+    fn upload_limiter(&self) -> Option<Arc<UploadLimiter>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +822,12 @@ impl BlobStore for S3Store {
 
     fn describe(&self) -> String {
         format!("s3://{}/{}", self.config.bucket, self.config.region)
+    }
+
+    fn upload_limiter(&self) -> Option<Arc<UploadLimiter>> {
+        self.throttle
+            .as_ref()
+            .map(|throttle| Arc::clone(&throttle.limiter))
     }
 }
 

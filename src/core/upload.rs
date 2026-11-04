@@ -18,6 +18,7 @@ use crate::core::engine::CancelToken;
 use crate::core::error::{BackupError, Result};
 use crate::core::status::TransferMeter;
 use crate::core::store::BlobStore;
+use crate::core::throttle::UploadLimiter;
 
 /// Hard cap on upload workers. The pool starts with a small target and scales
 /// up only when measured throughput justifies it.
@@ -298,8 +299,12 @@ pub struct UploadPool {
     controller: ScaleController,
     /// Duration-attributed bytes and worker-seconds.
     meter: TransferMeter,
-    /// EWMA of a single transfer's bytes/second, used for the live estimate.
+    /// EWMA of a single transfer's bytes/second. Only used as a fallback for
+    /// stores that do not expose a shared limiter.
     worker_rate_bps: u64,
+    /// The shared limiter, when present. Its live counter is the real
+    /// aggregate wire rate, so it is preferred over the per-worker estimate.
+    limiter: Option<Arc<UploadLimiter>>,
     measured_bps: u64,
     per_worker_bps: u64,
     utilization: f64,
@@ -339,6 +344,7 @@ impl UploadPool {
         let (tx, job_rx) = sync_channel::<UploadJob>((max_threads * 2).max(2));
         let (done_tx, rx) = std::sync::mpsc::channel::<UploadDone>();
         let job_rx = Arc::new(Mutex::new(job_rx));
+        let limiter = store.upload_limiter();
 
         for worker in 0..max_threads {
             let job_rx = Arc::clone(&job_rx);
@@ -415,6 +421,7 @@ impl UploadPool {
             controller: ScaleController::new(initial_threads, max_threads, now),
             meter: TransferMeter::new(),
             worker_rate_bps: 0,
+            limiter,
             measured_bps: 0,
             per_worker_bps: 0,
             utilization: 0.0,
@@ -495,11 +502,17 @@ impl UploadPool {
         let now = Instant::now();
         self.refresh(now);
         let active = self.gate.active();
+        // Prefer the shared limiter's real admitted-byte rate. The fallback
+        // (active workers x per-worker EWMA) over-reports whenever the pool
+        // scales up, because the per-worker rate was sampled at a lower
+        // concurrency. That made a shared 3 MB/s cap look like per-worker
+        // limits totalling 5-9 MB/s.
+        let speed_bps = match &self.limiter {
+            Some(limiter) => limiter.live_bps(),
+            None => active as u64 * self.worker_rate_bps,
+        };
         UploadPoolStats {
-            // Live estimate: measured per-worker rate times the workers that
-            // are actually uploading right now. This is the number the UI
-            // shows, so it does not fall to zero between large completions.
-            speed_bps: active as u64 * self.worker_rate_bps,
+            speed_bps,
             measured_bps: self.measured_bps,
             per_worker_bps: self.per_worker_bps,
             utilization: self.utilization,

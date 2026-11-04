@@ -45,6 +45,17 @@ pub fn partial_run_exists(store: &dyn BlobStore, root: &str) -> Result<bool> {
     Ok(store.head(&partial_run_key(root))?.is_some())
 }
 
+/// Marker for orphaned uploads that still need an authorized cleanup. A
+/// successful run that is not authorized to delete orphans leaves this marker
+/// behind so a later user-confirmed run can finish the job.
+pub fn cleanup_pending_key(root: &str) -> String {
+    root_key(root, "cleanuppending.json")
+}
+
+pub fn cleanup_pending_exists(store: &dyn BlobStore, root: &str) -> Result<bool> {
+    Ok(store.head(&cleanup_pending_key(root))?.is_some())
+}
+
 pub fn record_prefix(root: &str, folder_uuid: &str) -> String {
     root_key(root, &format!("backupfolders/{folder_uuid}/backuprecords"))
 }

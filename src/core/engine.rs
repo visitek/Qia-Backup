@@ -2294,7 +2294,10 @@ pub fn run_backup(
     cancel: CancelToken,
     progress: &mut dyn FnMut(ProgressEvent),
 ) -> Result<BackupSummary> {
-    run_backup_with_partial(config, store, cancel, progress, None)
+    // Library/CLI callers have already chosen to run a backup. The desktop
+    // shell passes an explicit authorization flag for the destructive cleanup
+    // of objects left behind by an interrupted run.
+    run_backup_with_partial(config, store, cancel, progress, None, true)
 }
 
 /// Run a backup while publishing a live partial tree for the file explorer.
@@ -2306,6 +2309,7 @@ pub fn run_backup_with_partial(
     cancel: CancelToken,
     progress: &mut dyn FnMut(ProgressEvent),
     partial: Option<PartialTree>,
+    cleanup_authorized: bool,
 ) -> Result<BackupSummary> {
     config::validate(config)?;
     config::validate_source(config)?;
@@ -2382,7 +2386,9 @@ pub fn run_backup_with_partial(
     // A marker left over from an earlier run means that run did not reach a
     // completed record (crash, force-quit, cancellation, or record-write
     // failure). The next success can safely collect objects that the earlier
-    // run uploaded but never journaled.
+    // run uploaded but never journaled. The cleanup is destructive, so it only
+    // runs when the caller obtained explicit authorization; otherwise the
+    // pending marker survives for a later authorized run.
     let previous_run_interrupted = match record::partial_run_exists(store, &root) {
         Ok(exists) => exists,
         Err(e) => {
@@ -2392,6 +2398,16 @@ pub fn run_backup_with_partial(
             false
         }
     };
+    let cleanup_was_pending = match record::cleanup_pending_exists(store, &root) {
+        Ok(exists) => exists,
+        Err(e) => {
+            logging::warn(format!(
+                "could not check for a pending orphan cleanup: {e}; automatic orphan cleanup is skipped"
+            ));
+            false
+        }
+    };
+    let cleanup_needed = previous_run_interrupted || cleanup_was_pending;
 
     // Mark the destination while a run is active. The explorer checks this
     // marker before trusting in-memory partial data; a successful run removes
@@ -2583,19 +2599,49 @@ pub fn run_backup_with_partial(
         // The just-saved index is already in memory. Reuse it to scan only the
         // data prefixes for objects left behind by the interrupted run. A
         // cleanup failure must never invalidate an otherwise complete backup.
-        if previous_run_interrupted {
-            (progress)(ProgressEvent::Phase {
-                name: "cleaning".into(),
-                detail: "removing objects left by the interrupted run".into(),
-            });
-            match retention::prune_orphans_with_index(config, store, &index, &cancel, false) {
-                Ok(cleanup) => logging::info(format!(
-                    "interrupted-run cleanup: scanned {} objects, deleted {} orphaned objects",
-                    cleanup.objects_scanned, cleanup.objects_deleted
-                )),
-                Err(e) => logging::warn(format!(
-                    "interrupted-run cleanup failed; the backup itself is complete: {e}"
-                )),
+        if cleanup_needed {
+            let cleanup_marker = record::cleanup_pending_key(&root);
+            if cleanup_authorized {
+                (progress)(ProgressEvent::Phase {
+                    name: "cleaning".into(),
+                    detail: "removing objects left by the interrupted run".into(),
+                });
+                match retention::prune_orphans_with_index(config, store, &index, &cancel, false) {
+                    Ok(cleanup) => {
+                        if let Err(e) = store.delete(&cleanup_marker) {
+                            logging::warn(format!(
+                                "could not clear pending orphan-cleanup marker: {e}"
+                            ));
+                        }
+                        logging::info(format!(
+                            "interrupted-run cleanup: scanned {} objects, deleted {} orphaned objects",
+                            cleanup.objects_scanned, cleanup.objects_deleted
+                        ));
+                    }
+                    Err(e) => {
+                        if let Err(marker_error) =
+                            store.put(&cleanup_marker, Utc::now().to_rfc3339().as_bytes())
+                        {
+                            logging::warn(format!(
+                                "could not persist pending orphan-cleanup marker: {marker_error}"
+                            ));
+                        }
+                        logging::warn(format!(
+                            "interrupted-run cleanup failed; the backup itself is complete: {e}"
+                        ));
+                    }
+                }
+            } else {
+                // Keep the fact that orphans are waiting for an authorized
+                // cleanup, even though this run removes the partial-run marker.
+                if let Err(e) = store.put(&cleanup_marker, Utc::now().to_rfc3339().as_bytes()) {
+                    logging::warn(format!(
+                        "could not persist pending orphan-cleanup marker: {e}"
+                    ));
+                }
+                logging::info(
+                    "orphaned uploads require authorization before cleanup; deferring to a later run",
+                );
             }
         }
 
@@ -2786,6 +2832,7 @@ mod tests {
                 }
             },
             Some(partial.clone()),
+            true,
         )
         .unwrap();
 
@@ -2852,6 +2899,77 @@ mod tests {
     }
 
     #[test]
+    fn unauthorized_run_preserves_orphan_cleanup_for_a_later_authorized_run() {
+        let src = std::env::temp_dir().join(format!("orphan-auth-src-{}", uuid::Uuid::new_v4()));
+        let store_dir =
+            std::env::temp_dir().join(format!("orphan-auth-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("keep.txt"), b"keep this data").unwrap();
+
+        let store = LocalStore::new(&store_dir).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.bucket = "b".into();
+        cfg.region = "r".into();
+        cfg.access_key_id = "a".into();
+        cfg.secret_access_key = "s".into();
+        cfg.source_kind = "path".into();
+        cfg.source_path = src.to_string_lossy().to_string();
+        cfg.schedule_minutes = 0;
+
+        let root = cfg.key_root();
+        store
+            .put(
+                &record::partial_run_key(&root),
+                b"previous run was interrupted",
+            )
+            .unwrap();
+        let orphan = format!(
+            "{}/blobpacks/orphan-{}.blobpack",
+            root,
+            uuid::Uuid::new_v4()
+        );
+        store.put(&orphan, b"orphan").unwrap();
+
+        // No authorization: the backup succeeds, but the destructive cleanup
+        // is deferred and a durable marker keeps it pending.
+        run_backup_with_partial(
+            &mut cfg,
+            &store,
+            CancelToken::new(),
+            &mut |_| {},
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            store.head(&orphan).unwrap().is_some(),
+            "unauthorized runs must not delete orphaned uploads"
+        );
+        assert!(
+            record::cleanup_pending_exists(&store, &root).unwrap(),
+            "the deferred cleanup must be recorded"
+        );
+        assert!(
+            !record::partial_run_exists(&store, &root).unwrap(),
+            "the completed run still clears the partial-run marker"
+        );
+
+        // A later authorized run finishes the deferred cleanup.
+        run_backup(&mut cfg, &store, CancelToken::new(), &mut |_| {}).unwrap();
+        assert!(
+            store.head(&orphan).unwrap().is_none(),
+            "the authorized run should finally remove orphaned uploads"
+        );
+        assert!(
+            !record::cleanup_pending_exists(&store, &root).unwrap(),
+            "a successful cleanup clears the pending marker"
+        );
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&store_dir).ok();
+    }
+
+    #[test]
     fn cancelled_backup_keeps_partial_tree_for_browsing() {
         let src = std::env::temp_dir().join(format!("partial-cancel-src-{}", uuid::Uuid::new_v4()));
         let store_dir =
@@ -2887,6 +3005,7 @@ mod tests {
                 }
             },
             Some(partial.clone()),
+            true,
         );
         assert!(matches!(result, Err(BackupError::Cancelled)));
         assert!(partial.is_available(), "cancel must keep the live tree");
@@ -3355,6 +3474,7 @@ mod more_tests {
             CancelToken::new(),
             &mut |_| {},
             Some(partial.clone()),
+            true,
         )
         .unwrap_err();
         assert!(matches!(err, BackupError::S3(_)), "got {err:?}");

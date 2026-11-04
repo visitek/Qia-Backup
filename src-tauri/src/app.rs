@@ -684,11 +684,25 @@ async fn list_partial_entries(
 }
 
 #[tauri::command]
-fn start_backup(state: State<'_, SharedState>, app: AppHandle) -> Result<(), String> {
-    start_backup_inner(state.inner().clone(), app, "manual")
+fn start_backup(
+    state: State<'_, SharedState>,
+    app: AppHandle,
+    cleanup_authorized: Option<bool>,
+) -> Result<(), String> {
+    start_backup_inner(
+        state.inner().clone(),
+        app,
+        "manual",
+        cleanup_authorized.unwrap_or(false),
+    )
 }
 
-fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Result<(), String> {
+fn start_backup_inner(
+    inner: SharedState,
+    app: AppHandle,
+    reason: &str,
+    cleanup_authorized: bool,
+) -> Result<(), String> {
     {
         let status = inner.status.lock();
         if status.running || status.restoring || status.editing {
@@ -700,6 +714,9 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
             .power
             .message()
             .unwrap_or_else(|| "backups are paused until power conditions recover".into()));
+    }
+    if cleanup_authorized {
+        consume_sensitive_grant(inner.as_ref(), "cleanup")?;
     }
     let config = inner.config.lock().clone();
     config::validate_connection(&config).map_err(err)?;
@@ -762,6 +779,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                         }
                     },
                     Some(partial_tree.clone()),
+                    cleanup_authorized,
                 ),
                 Err(e) => Err(e),
             },
@@ -965,6 +983,7 @@ async fn authorize_sensitive_action(
         "remove" => "remove a file from a backup revision",
         "delete_set" => "delete the entire backup set",
         "prune" => "delete old backup revisions",
+        "cleanup" => "clean up uploads left by an interrupted backup",
         _ => return Err("unknown sensitive action".into()),
     }
     .to_string();
@@ -982,6 +1001,23 @@ async fn authorize_sensitive_action(
 #[tauri::command]
 fn clear_sensitive_authorization(state: State<'_, SharedState>) {
     *state.sensitive_auth.lock() = None;
+}
+
+/// Report whether an interrupted run left uploads that require an authorized
+/// cleanup. The UI checks this before a manual backup so it can show
+/// Confirm -> Auth instead of cleaning automatically.
+#[tauri::command]
+async fn cleanup_pending(state: State<'_, SharedState>) -> Result<bool, String> {
+    let cfg = state.config.lock().clone();
+    config::validate(&cfg).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = new_store(&cfg).map_err(err)?;
+        let root = cfg.key_root();
+        Ok(record::partial_run_exists(store.as_ref(), &root).map_err(err)?
+            || record::cleanup_pending_exists(store.as_ref(), &root).map_err(err)?)
+    })
+    .await
+    .map_err(err)?
 }
 
 fn spawn_power_watcher(inner: SharedState) {
@@ -1714,6 +1750,7 @@ pub fn run() {
             apply_upload_limit,
             authorize_sensitive_action,
             clear_sensitive_authorization,
+            cleanup_pending,
             start_backup,
             cancel_backup,
             cancel_power_pause,
@@ -1880,7 +1917,12 @@ pub fn run() {
                     }
                     if power_paused {
                         if let Err(e) =
-                            start_backup_inner(scheduler_inner.clone(), handle.clone(), "resumed")
+                            start_backup_inner(
+                                scheduler_inner.clone(),
+                                handle.clone(),
+                                "resumed",
+                                false,
+                            )
                         {
                             logging::debug(format!("could not resume powered-off backup: {e}"));
                         }
@@ -1897,9 +1939,12 @@ pub fn run() {
                         scheduler::is_due(cfg.last_backup_at, cfg.schedule_minutes)
                     };
                     if due {
-                        if let Err(e) =
-                            start_backup_inner(scheduler_inner.clone(), handle.clone(), "scheduled")
-                        {
+                        if let Err(e) = start_backup_inner(
+                            scheduler_inner.clone(),
+                            handle.clone(),
+                            "scheduled",
+                            false,
+                        ) {
                             logging::debug(format!("scheduler did not start a backup: {e}"));
                         }
                     }

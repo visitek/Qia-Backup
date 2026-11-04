@@ -23,12 +23,20 @@ pub const MIN_UPLOAD_LIMIT_BPS: u64 = 256 * 1024;
 const TOKEN_SLICE: u64 = 64 * 1024;
 const MAX_WAIT: Duration = Duration::from_millis(100);
 const MIN_WAIT: Duration = Duration::from_millis(1);
+/// Window used for the live throughput estimate reported to the UI.
+const LIVE_WINDOW_SECS: usize = 5;
 
 struct LimiterState {
     enabled: bool,
     limit_bps: u64,
     tokens: f64,
     last_refill: Instant,
+    /// Bytes admitted per whole second, used for the live throughput reading.
+    /// Every byte that passes through the limiter is recorded, even when the
+    /// limit is disabled, so the UI always reports real upload throughput.
+    rate_origin: Instant,
+    rate_seconds: [u64; LIVE_WINDOW_SECS],
+    rate_bytes: [u64; LIVE_WINDOW_SECS],
 }
 
 /// A shared token bucket for upload throttling.
@@ -39,13 +47,17 @@ pub struct UploadLimiter {
 
 impl UploadLimiter {
     pub fn new(enabled: bool, limit_bps: u64) -> Self {
+        let now = Instant::now();
         Self {
             state: Mutex::new(LimiterState {
                 enabled,
                 limit_bps: limit_bps.max(MIN_UPLOAD_LIMIT_BPS),
                 // Start empty so enabling a limit cannot produce a large burst.
                 tokens: 0.0,
-                last_refill: Instant::now(),
+                last_refill: now,
+                rate_origin: now,
+                rate_seconds: [u64::MAX; LIVE_WINDOW_SECS],
+                rate_bytes: [0; LIVE_WINDOW_SECS],
             }),
             changed: Condvar::new(),
         }
@@ -74,6 +86,14 @@ impl UploadLimiter {
         (state.enabled, state.limit_bps)
     }
 
+    /// Upload throughput actually admitted through the shared limiter over the
+    /// last few seconds. This is the authoritative aggregate rate: it cannot
+    /// exceed the configured cap and it does not depend on worker count.
+    pub fn live_bps(&self) -> u64 {
+        let state = self.state.lock().expect("upload limiter poisoned");
+        state.live_bps(Instant::now())
+    }
+
     /// Block until `bytes` may be sent. The wait is cancellation-aware and is
     /// split into small slices so a live rate change takes effect promptly.
     pub fn acquire(&self, bytes: u64, cancel: &CancelToken) -> Result<()> {
@@ -96,12 +116,15 @@ impl UploadLimiter {
                 return Err(BackupError::Cancelled);
             }
             if !state.enabled {
+                state.record_live(bytes, Instant::now());
                 return Ok(());
             }
-            state.refill(Instant::now());
+            let now = Instant::now();
+            state.refill(now);
             let need = bytes as f64;
             if state.tokens >= need {
                 state.tokens -= need;
+                state.record_live(bytes, now);
                 return Ok(());
             }
             let missing = need - state.tokens;
@@ -128,6 +151,32 @@ impl LimiterState {
         } else {
             self.tokens = 0.0;
         }
+    }
+
+    fn record_live(&mut self, bytes: u64, now: Instant) {
+        let second = now.saturating_duration_since(self.rate_origin).as_secs();
+        let index = (second as usize) % LIVE_WINDOW_SECS;
+        if self.rate_seconds[index] != second {
+            self.rate_seconds[index] = second;
+            self.rate_bytes[index] = 0;
+        }
+        self.rate_bytes[index] = self.rate_bytes[index].saturating_add(bytes);
+    }
+
+    fn live_bps(&self, now: Instant) -> u64 {
+        let second = now.saturating_duration_since(self.rate_origin).as_secs();
+        let first = second.saturating_sub(LIVE_WINDOW_SECS as u64 - 1);
+        let mut bytes = 0u64;
+        for index in 0..LIVE_WINDOW_SECS {
+            let bucket_second = self.rate_seconds[index];
+            if bucket_second != u64::MAX && bucket_second >= first && bucket_second <= second {
+                bytes = bytes.saturating_add(self.rate_bytes[index]);
+            }
+        }
+        // Avoid reporting an artificially tiny rate during the first second.
+        let elapsed = now.saturating_duration_since(self.rate_origin).as_secs_f64();
+        let divisor = elapsed.clamp(1.0, LIVE_WINDOW_SECS as f64);
+        (bytes as f64 / divisor) as u64
     }
 }
 
@@ -245,6 +294,46 @@ mod tests {
         let result = worker.join().unwrap();
         assert!(matches!(result, Err(BackupError::Cancelled)));
         assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn live_rate_reflects_admitted_bytes() {
+        let limiter = UploadLimiter::new(false, DEFAULT_UPLOAD_LIMIT_BPS);
+        assert_eq!(limiter.live_bps(), 0);
+        limiter
+            .acquire(256 * 1024, &CancelToken::new())
+            .unwrap();
+        let bps = limiter.live_bps();
+        assert!(
+            (128 * 1024..=512 * 1024).contains(&bps),
+            "256 KiB in the first second should read as ~256 KiB/s, got {bps}"
+        );
+    }
+
+    #[test]
+    fn live_rate_is_shared_across_waiters() {
+        let limit = 512 * 1024;
+        let limiter = Arc::new(UploadLimiter::new(true, limit));
+        let started = Instant::now();
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let limiter = Arc::clone(&limiter);
+                std::thread::spawn(move || {
+                    limiter
+                        .acquire(256 * 1024, &CancelToken::new())
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let live = limiter.live_bps();
+        assert!(
+            live <= (limit as f64 * 1.3) as u64,
+            "live rate {live} should not exceed the shared limit, took {elapsed:.2}s"
+        );
     }
 
     #[test]

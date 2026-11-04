@@ -318,6 +318,34 @@ async function clearSensitiveAuthorization() {
   try { await invoke("clear_sensitive_authorization"); } catch (_) { /* ignore */ }
 }
 
+async function startBackupNow() {
+  if (demo || !invoke) {
+    toast("Preview mode — run the macOS app to back up.");
+    return false;
+  }
+  try {
+    let cleanupAuthorized = false;
+    if (await invoke("cleanup_pending")) {
+      const ok = await confirmAction({
+        title: "Clean up interrupted backup data?",
+        message: "An earlier backup left uploads that are not part of any journal.",
+        detail: "After the new backup completes, those orphaned uploads can be removed. Authentication is required before cleanup.",
+        confirmLabel: "Clean up after backup",
+        danger: true,
+      });
+      if (!ok) return false;
+      const authed = await authorizeSensitive("cleanup");
+      if (!authed) return false;
+      cleanupAuthorized = true;
+    }
+    await invoke("start_backup", { cleanupAuthorized });
+    return true;
+  } catch (e) {
+    toast(String(e), true);
+    return false;
+  }
+}
+
 function showView(name) {
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
@@ -1318,8 +1346,6 @@ async function removeFilesEntry(path) {
   if (state.status?.running || state.status?.restoring || state.status?.editing || state.filesActionBusy) {
     return toast("Stop the active backup or restore before removing files.", true);
   }
-  const authed = await authorizeSensitive("remove");
-  if (!authed) return;
   const ok = await confirmAction({
     title: "Remove from this revision?",
     message: `Remove "${path}" from this backup revision?`,
@@ -1327,10 +1353,9 @@ async function removeFilesEntry(path) {
     confirmLabel: "Remove",
     danger: true,
   });
-  if (!ok) {
-    await clearSensitiveAuthorization();
-    return;
-  }
+  if (!ok) return;
+  const authed = await authorizeSensitive("remove");
+  if (!authed) return;
   state.filesActionBusy = true;
   renderFiles();
   try {
@@ -1362,8 +1387,6 @@ async function removeIgnoredFiles() {
   if (state.status?.running || state.status?.restoring || state.status?.editing || state.filesActionBusy) {
     return toast("Stop the active backup or restore before removing files.", true);
   }
-  const authed = await authorizeSensitive("remove");
-  if (!authed) return;
   const ok = await confirmAction({
     title: "Remove all ignored paths?",
     message: "Remove every path that matches the current ignore rules from this backup revision?",
@@ -1371,10 +1394,9 @@ async function removeIgnoredFiles() {
     confirmLabel: "Remove all ignored",
     danger: true,
   });
-  if (!ok) {
-    await clearSensitiveAuthorization();
-    return;
-  }
+  if (!ok) return;
+  const authed = await authorizeSensitive("remove");
+  if (!authed) return;
   state.filesActionBusy = true;
   renderFiles();
   try {
@@ -2104,9 +2126,10 @@ function bind() {
     toast("Retention reset to the default policy");
   });
   $("backup-now").addEventListener("click", async () => {
-    if (demo) return toast("Preview mode — run the macOS app to back up.");
-    try { await invoke("start_backup"); state.lastRunning = true; toast("Backup started"); }
-    catch (e) { toast(String(e), true); }
+    if (await startBackupNow()) {
+      state.lastRunning = true;
+      toast("Backup started");
+    }
   });
   $("toggle-auto").addEventListener("click", async () => {
     if (demo) return toast("Preview mode — automatic backups are not scheduled.");
@@ -2416,8 +2439,6 @@ function bind() {
   });
   $("delete-set").addEventListener("click", async () => {
     if (demo) return toast("Preview mode");
-    const authed = await authorizeSensitive("delete_set");
-    if (!authed) return;
     const ok = await confirmAction({
       title: "Delete the entire backup set?",
       message: "Delete every object in this backup set?",
@@ -2425,10 +2446,9 @@ function bind() {
       confirmLabel: "Delete everything",
       danger: true,
     });
-    if (!ok) {
-      await clearSensitiveAuthorization();
-      return;
-    }
+    if (!ok) return;
+    const authed = await authorizeSensitive("delete_set");
+    if (!authed) return;
     try {
       const n = await invoke("delete_backup_set");
       toast(`Deleted ${n} objects`);
