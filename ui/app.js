@@ -455,10 +455,14 @@ function applyConfig(cfg) {
   updateIamPolicyButton();
 }
 
-function resetSourceDefaults() {
+function resetIncludedDefaults() {
   $("included-folders").value = DEFAULT_INCLUDED_FOLDERS.join("\n");
+  toast("Recommended included folders restored — click Save settings");
+}
+
+function resetExcludeDefaults() {
   $("excludes").value = DEFAULT_EXCLUDE_PATTERNS.join("\n");
-  toast("Recommended folders and cache exclusions restored — click Save settings");
+  toast("Recommended exclusions restored — click Save settings");
 }
 
 function textareaLines(id) {
@@ -2195,7 +2199,8 @@ function bind() {
   $("add-included-folder").addEventListener("click", () => pickBackupPath("folder", "include"));
   $("add-excluded-file").addEventListener("click", () => pickBackupPath("file", "exclude"));
   $("add-excluded-folder").addEventListener("click", () => pickBackupPath("folder", "exclude"));
-  $("reset-source-defaults").addEventListener("click", resetSourceDefaults);
+  $("reset-included-defaults").addEventListener("click", resetIncludedDefaults);
+  $("reset-exclude-defaults").addEventListener("click", resetExcludeDefaults);
   $("retain-all").addEventListener("change", updateRetentionUI);
   ["retain-hours", "retain-days", "retain-weeks", "retain-months"].forEach((id) => {
     $(id).addEventListener("input", updateRetentionUI);
