@@ -1,9 +1,12 @@
 //! Persistent blob index: maps content identifiers to their location and
 //! tracks blob packs so retention can delete unreferenced packs safely.
 //!
-//! Scale note: the on-disk representation is still JSON. For multi-million
-//! blob sets, loading and checkpointing the full map becomes the dominant
-//! startup cost; a compact/binary index is the next major optimization.
+//! The base index is stored in a compact binary format. Blob IDs are raw
+//! SHA-256 bytes, pack/standalone paths are stored once in a path table, and
+//! blobs sharing a path are grouped so the path is not repeated per chunk.
+//! This matters because a multi-million-blob set used to serialize as a huge
+//! JSON object that had to be downloaded on every run. Version-1 JSON indexes
+//! remain readable and are rewritten as version 2 on the next compaction.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -20,7 +23,11 @@ use crate::core::store::BlobStore;
 /// Current on-disk index/journal schema. Bump this when the representation
 /// changes incompatibly and add a migration path; an older app must never
 /// reinterpret or overwrite a newer index.
-pub const CURRENT_INDEX_VERSION: u32 = 1;
+pub const CURRENT_INDEX_VERSION: u32 = 2;
+
+/// Magic prefix for the compact binary base index. The version follows it as
+/// a little-endian u32 so a future layout can keep the same prefix.
+const INDEX_MAGIC: &[u8; 4] = b"QIDX";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackInfo {
@@ -53,6 +60,96 @@ pub struct IndexJournal {
     pub blobs: HashMap<String, BlobLoc>,
     #[serde(default)]
     pub packs: HashMap<String, PackInfo>,
+}
+
+/// Small sidecar next to the local index cache. It records which remote base
+/// object the cache was derived from, so an unchanged remote index can be
+/// confirmed with a cheap HEAD instead of downloading hundreds of megabytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalIndexMeta {
+    etag: Option<String>,
+    size: u64,
+}
+
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift = shift.checked_add(7)?;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = pos.checked_add(len)?;
+    let slice = bytes.get(*pos..end)?;
+    *pos = end;
+    Some(slice)
+}
+
+fn read_u8(bytes: &[u8], pos: &mut usize) -> Option<u8> {
+    Some(*take(bytes, pos, 1)?.first()?)
+}
+
+fn read_u32_le(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    let raw: [u8; 4] = take(bytes, pos, 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(raw))
+}
+
+fn read_i64_le(bytes: &[u8], pos: &mut usize) -> Option<i64> {
+    let raw: [u8; 8] = take(bytes, pos, 8)?.try_into().ok()?;
+    Some(i64::from_le_bytes(raw))
+}
+
+/// Most IDs are 64-character SHA-256 hex. Store those as 32 raw bytes; keep a
+/// length-prefixed string fallback for legacy/imported identifiers.
+fn write_blob_id(out: &mut Vec<u8>, id: &str) -> Result<()> {
+    if id.len() == 64 {
+        let mut raw = [0u8; 32];
+        if hex::decode_to_slice(id, &mut raw).is_ok() {
+            out.push(32);
+            out.extend_from_slice(&raw);
+            return Ok(());
+        }
+    }
+    if id.len() > 0x7f {
+        return Err(BackupError::Codec(format!(
+            "blob identifier is too long ({} bytes)",
+            id.len()
+        )));
+    }
+    out.push(0x80 | id.len() as u8);
+    out.extend_from_slice(id.as_bytes());
+    Ok(())
+}
+
+fn read_blob_id(bytes: &[u8], pos: &mut usize) -> Option<String> {
+    let header = read_u8(bytes, pos)?;
+    if header & 0x80 != 0 {
+        let len = (header & 0x7f) as usize;
+        let raw = take(bytes, pos, len)?;
+        return Some(std::str::from_utf8(raw).ok()?.to_string());
+    }
+    if header != 32 {
+        return None;
+    }
+    Some(hex::encode(take(bytes, pos, 32)?))
 }
 
 impl Default for BlobIndex {
@@ -107,12 +204,43 @@ impl BlobIndex {
             .join(format!("{}.json", Self::namespace(config)))
     }
 
+    fn local_meta_path(config: &AppConfig) -> PathBuf {
+        config::app_support_dir()
+            .join("index")
+            .join(format!("{}.meta.json", Self::namespace(config)))
+    }
+
     pub fn load_local(config: &AppConfig) -> Option<Self> {
         let path = Self::local_path(config);
         let bytes = std::fs::read(&path).ok()?;
-        let index: Self = serde_json::from_slice(&bytes).ok()?;
+        let index = Self::decode_plain(&bytes)?;
         // A newer local cache must not be interpreted with an older schema.
         (index.version <= CURRENT_INDEX_VERSION).then_some(index)
+    }
+
+    fn load_local_meta(config: &AppConfig) -> Option<LocalIndexMeta> {
+        let bytes = std::fs::read(Self::local_meta_path(config)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn write_local_meta(config: &AppConfig, meta: &LocalIndexMeta) {
+        let path = Self::local_meta_path(config);
+        let write = || -> Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).at(parent)?;
+            }
+            let tmp = path.with_extension("meta.tmp");
+            std::fs::write(&tmp, serde_json::to_vec(meta)?).at(&tmp)?;
+            std::fs::rename(&tmp, &path).at(&path)?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            logging::warn(format!("could not write local index metadata: {e}"));
+        }
+    }
+
+    fn clear_local_meta(config: &AppConfig) {
+        let _ = std::fs::remove_file(Self::local_meta_path(config));
     }
 
     fn write_local_bytes(config: &AppConfig, bytes: &[u8]) -> Result<()> {
@@ -127,8 +255,185 @@ impl BlobIndex {
     }
 
     pub fn save_local(&self, config: &AppConfig) -> Result<()> {
-        let bytes = serde_json::to_vec(self)?;
+        let bytes = self.encode_binary()?;
         Self::write_local_bytes(config, &bytes)
+    }
+
+    /// Compact binary encoding. Paths are interned once and blobs are grouped
+    /// by path so a pack path (and its prefix) is not repeated for every chunk.
+    fn encode_binary(&self) -> Result<Vec<u8>> {
+        let mut paths: Vec<&str> = self.packs.keys().map(String::as_str).collect();
+        paths.extend(self.blobs.values().map(|loc| loc.relative_path.as_str()));
+        paths.sort_unstable();
+        paths.dedup();
+        let path_index: HashMap<&str, u32> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (*path, index as u32))
+            .collect();
+
+        let mut groups: Vec<(u32, bool, &BlobLoc)> = Vec::with_capacity(self.blobs.len());
+        for (key, loc) in &self.blobs {
+            if key != &loc.blob_identifier {
+                return Err(BackupError::Codec(format!(
+                    "blob index entry {key} has mismatched identifier {}",
+                    loc.blob_identifier
+                )));
+            }
+            let path = *path_index
+                .get(loc.relative_path.as_str())
+                .ok_or_else(|| BackupError::Codec("blob index path is not interned".into()))?;
+            groups.push((path, loc.is_packed, loc));
+        }
+        groups.sort_unstable_by_key(|(path, packed, _)| (*path, *packed));
+
+        let mut out = Vec::with_capacity(24 + self.blobs.len() * 44 + paths.len() * 24);
+        out.extend_from_slice(INDEX_MAGIC);
+        // Writers always emit the current layout. A loaded v1 index is
+        // transparently upgraded the next time it is saved.
+        out.extend_from_slice(&CURRENT_INDEX_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.updated_at.timestamp_millis().to_le_bytes());
+        write_varint(&mut out, paths.len() as u64);
+        for path in &paths {
+            write_varint(&mut out, path.len() as u64);
+            out.extend_from_slice(path.as_bytes());
+        }
+
+        let mut pack_entries: Vec<(&String, &PackInfo)> = self.packs.iter().collect();
+        pack_entries.sort_unstable_by_key(|(_, pack)| path_index[pack.path.as_str()]);
+        write_varint(&mut out, pack_entries.len() as u64);
+        for (key, pack) in pack_entries {
+            if key != &pack.path {
+                return Err(BackupError::Codec(format!(
+                    "pack index entry {key} has mismatched path {}",
+                    pack.path
+                )));
+            }
+            write_varint(&mut out, path_index[pack.path.as_str()] as u64);
+            write_varint(&mut out, pack.size);
+        }
+
+        let mut group_count = 0usize;
+        let mut cursor = 0usize;
+        while cursor < groups.len() {
+            group_count += 1;
+            let (path, packed, _) = groups[cursor];
+            cursor += 1;
+            while cursor < groups.len() && groups[cursor].0 == path && groups[cursor].1 == packed {
+                cursor += 1;
+            }
+        }
+        write_varint(&mut out, group_count as u64);
+
+        let mut cursor = 0usize;
+        while cursor < groups.len() {
+            let (path, packed, _) = groups[cursor];
+            let start = cursor;
+            cursor += 1;
+            while cursor < groups.len() && groups[cursor].0 == path && groups[cursor].1 == packed {
+                cursor += 1;
+            }
+            write_varint(&mut out, path as u64);
+            out.push(if packed { 1 } else { 0 });
+            write_varint(&mut out, (cursor - start) as u64);
+            for (_, _, loc) in &groups[start..cursor] {
+                write_blob_id(&mut out, &loc.blob_identifier)?;
+                let compression = u8::try_from(loc.compression_type).map_err(|_| {
+                    BackupError::Codec(format!(
+                        "compression type {} does not fit the index format",
+                        loc.compression_type
+                    ))
+                })?;
+                out.push(if loc.stretch_encryption_key { 1 } else { 0 });
+                out.push(compression);
+                write_varint(&mut out, loc.offset);
+                write_varint(&mut out, loc.length);
+            }
+        }
+        Ok(out)
+    }
+
+    fn decode_binary(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 16 || &bytes[..4] != INDEX_MAGIC {
+            return None;
+        }
+        let mut pos = 4;
+        let version = read_u32_le(bytes, &mut pos)?;
+        if version > CURRENT_INDEX_VERSION {
+            // Let the caller report a precise "newer than supported" error.
+            return Some(Self {
+                version,
+                updated_at: Utc::now(),
+                blobs: HashMap::new(),
+                packs: HashMap::new(),
+                journal_segments: 0,
+            });
+        }
+        let updated_at = DateTime::<Utc>::from_timestamp_millis(read_i64_le(bytes, &mut pos)?)
+            .unwrap_or_else(Utc::now);
+
+        let path_count = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+        let mut paths = Vec::with_capacity(path_count);
+        for _ in 0..path_count {
+            let len = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+            let raw = take(bytes, &mut pos, len)?;
+            paths.push(std::str::from_utf8(raw).ok()?.to_string());
+        }
+
+        let pack_count = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+        let mut packs = HashMap::with_capacity(pack_count);
+        for _ in 0..pack_count {
+            let index = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+            let size = read_varint(bytes, &mut pos)?;
+            let path = paths.get(index)?.clone();
+            packs.insert(path.clone(), PackInfo { path, size });
+        }
+
+        let group_count = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+        let mut blobs = HashMap::new();
+        for _ in 0..group_count {
+            let index = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+            let packed = read_u8(bytes, &mut pos)? != 0;
+            let count = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+            let path = paths.get(index)?.clone();
+            for _ in 0..count {
+                let id = read_blob_id(bytes, &mut pos)?;
+                let flags = read_u8(bytes, &mut pos)?;
+                let compression_type = read_u8(bytes, &mut pos)? as u32;
+                let offset = read_varint(bytes, &mut pos)?;
+                let length = read_varint(bytes, &mut pos)?;
+                blobs.insert(
+                    id.clone(),
+                    BlobLoc {
+                        blob_identifier: id,
+                        is_packed: packed,
+                        relative_path: path.clone(),
+                        offset,
+                        length,
+                        stretch_encryption_key: flags & 1 != 0,
+                        compression_type,
+                    },
+                );
+            }
+        }
+        if pos != bytes.len() {
+            return None;
+        }
+        Some(Self {
+            version: CURRENT_INDEX_VERSION,
+            updated_at,
+            blobs,
+            packs,
+            journal_segments: 0,
+        })
+    }
+
+    fn decode_plain(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(INDEX_MAGIC) {
+            Self::decode_binary(bytes)
+        } else {
+            serde_json::from_slice(bytes).ok()
+        }
     }
 
     pub fn remote_key(root: &str) -> String {
@@ -154,7 +459,7 @@ impl BlobIndex {
         } else {
             bytes.to_vec()
         };
-        serde_json::from_slice(&plain).ok()
+        Self::decode_plain(&plain)
     }
 
     fn decode_journal(bytes: &[u8]) -> Option<IndexJournal> {
@@ -206,46 +511,79 @@ impl BlobIndex {
     /// objects from a cleared bucket and is unsafe to dedupe against.
     pub fn load(store: &dyn BlobStore, root: &str, config: &AppConfig) -> Result<Self> {
         let local = Self::load_local(config);
-        let remote = match store.get_opt(&Self::remote_key(root)) {
-            Ok(Some(bytes)) => match Self::decode_index(&bytes) {
-                Some(index) if index.version <= CURRENT_INDEX_VERSION => Some(index),
-                Some(index) => {
-                    return Err(BackupError::Store(format!(
-                        "blob index version {} is newer than supported version {CURRENT_INDEX_VERSION}",
-                        index.version
-                    )));
-                }
+        let local_meta = Self::load_local_meta(config);
+        let remote_key = Self::remote_key(root);
+        let remote_head = store.head(&remote_key)?;
+
+        // A local cache whose recorded ETag/size matches the remote object is
+        // already the same base. The journals are still replayed below, so
+        // checkpoints written after the last compaction are not missed. This
+        // avoids downloading a very large base on every run.
+        let local_matches_remote = local.is_some()
+            && remote_head.as_ref().is_some_and(|head| {
+                head.etag.is_some()
+                    && local_meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.etag == head.etag && meta.size == head.size)
+            });
+
+        let mut remote = None;
+        if remote_head.is_some() && !local_matches_remote {
+            match store.get_opt(&remote_key)? {
+                Some(bytes) => match Self::decode_index(&bytes) {
+                    Some(index) if index.version <= CURRENT_INDEX_VERSION => {
+                        remote = Some(index);
+                    }
+                    Some(index) => {
+                        return Err(BackupError::Store(format!(
+                            "blob index version {} is newer than supported version {CURRENT_INDEX_VERSION}",
+                            index.version
+                        )));
+                    }
+                    None => {
+                        return Err(BackupError::Store(
+                            "remote blob index is unreadable; refusing to start from a partial index"
+                                .into(),
+                        ));
+                    }
+                },
                 None => {
-                    return Err(BackupError::Store(
-                        "remote blob index is unreadable; refusing to start from a partial index"
-                            .into(),
-                    ));
+                    // The object disappeared between HEAD and GET. Treat it as
+                    // a missing base and keep the safe local-cache rule below.
                 }
-            },
-            Ok(None) => None,
-            Err(e) => return Err(e),
-        };
+            }
+        }
 
         let mut ignored_local_without_base = false;
-        let mut index = match (local, remote) {
-            (Some(local), Some(remote)) => {
-                if local.updated_at >= remote.updated_at {
-                    let mut merged = local;
-                    merged.merge_index(remote);
-                    merged
-                } else {
-                    // The remote base is newer, so the local cache is a
-                    // subset. Using it as the accumulator would double peak
-                    // memory for a multi-million-blob index for no gain.
+        let mut cache_needs_write = false;
+        let mut index = if local_matches_remote {
+            local.unwrap_or_default()
+        } else {
+            match (local, remote) {
+                (Some(local), Some(remote)) => {
+                    cache_needs_write = true;
+                    if local.updated_at >= remote.updated_at {
+                        let mut merged = local;
+                        merged.merge_index(remote);
+                        merged
+                    } else {
+                        // The remote base is newer, so the local cache is a
+                        // subset. Using it as the accumulator would double peak
+                        // memory for a multi-million-blob index for no gain.
+                        remote
+                    }
+                }
+                (Some(_), None) => {
+                    ignored_local_without_base = true;
+                    cache_needs_write = true;
+                    Self::default()
+                }
+                (None, Some(remote)) => {
+                    cache_needs_write = true;
                     remote
                 }
+                (None, None) => Self::default(),
             }
-            (Some(_), None) => {
-                ignored_local_without_base = true;
-                Self::default()
-            }
-            (None, Some(remote)) => remote,
-            (None, None) => Self::default(),
         };
 
         index.journal_segments = 0;
@@ -290,6 +628,31 @@ impl BlobIndex {
                 logging::warn(
                     "remote blob index is missing and no journal segments were found; ignoring local cache to avoid stale dedupe",
                 );
+            }
+        }
+
+        // Keep the local cache aligned with the base we just read so the next
+        // run can use HEAD instead of downloading it again. If writing the
+        // cache fails, leave no metadata behind that could make a stale cache
+        // look current.
+        if cache_needs_write {
+            match index.save_local(config) {
+                Ok(()) => match &remote_head {
+                    Some(head) if head.etag.is_some() => {
+                        Self::write_local_meta(
+                            config,
+                            &LocalIndexMeta {
+                                etag: head.etag.clone(),
+                                size: head.size,
+                            },
+                        );
+                    }
+                    _ => Self::clear_local_meta(config),
+                },
+                Err(e) => {
+                    logging::warn(format!("could not refresh local index cache: {e}"));
+                    Self::clear_local_meta(config);
+                }
             }
         }
         Ok(index)
@@ -352,19 +715,68 @@ impl BlobIndex {
     }
 
     pub fn save(&self, store: &dyn BlobStore, root: &str, config: &AppConfig) -> Result<()> {
-        // Serialize once and reuse the bytes for both the local cache and the
+        // Encode once and reuse the bytes for both the local cache and the
         // remote compressed base. On a multi-million-blob index this halves
         // the serialization CPU and peak allocation.
-        let json = serde_json::to_vec(self)?;
+        let binary = self.encode_binary()?;
+        // Never overwrite the live S3 base with a new representation unless it
+        // decodes back to exactly the same index. This turns a future encoder
+        // bug into a failed backup instead of an unreadable dedupe index.
+        let verified = Self::decode_binary(&binary)
+            .ok_or_else(|| BackupError::Codec("encoded blob index failed its self-check".into()))?;
+        let verified_ok = verified.blobs.len() == self.blobs.len()
+            && verified.packs.len() == self.packs.len()
+            && self
+                .blobs
+                .iter()
+                .all(|(id, loc)| verified.blobs.get(id) == Some(loc))
+            && self.packs.iter().all(|(path, pack)| {
+                verified
+                    .packs
+                    .get(path)
+                    .is_some_and(|other| other.path == pack.path && other.size == pack.size)
+            });
+        if !verified_ok {
+            return Err(BackupError::Codec(
+                "encoded blob index failed its self-check".into(),
+            ));
+        }
         // The local file is only a cache. A full or unwritable local disk must
         // not prevent the durable remote index from being written and the
         // backup from completing.
-        if let Err(e) = Self::write_local_bytes(config, &json) {
-            logging::warn(format!("could not write local index cache: {e}"));
-        }
-        let compressed = crate::core::compression::lz4_compress_with_prefix(&json);
+        let local_written = match Self::write_local_bytes(config, &binary) {
+            Ok(()) => true,
+            Err(e) => {
+                logging::warn(format!("could not write local index cache: {e}"));
+                false
+            }
+        };
+        let compressed = crate::core::compression::lz4_compress_with_prefix(&binary);
         let key = Self::remote_key(root);
         store.put(&key, &compressed)?;
+        // Remember which remote object this cache corresponds to. If HEAD
+        // cannot confirm it, leave no metadata so the next load downloads
+        // rather than trusting a possibly stale cache.
+        if local_written {
+            match store.head(&key) {
+                Ok(Some(info)) if info.etag.is_some() => {
+                    Self::write_local_meta(
+                        config,
+                        &LocalIndexMeta {
+                            etag: info.etag,
+                            size: info.size,
+                        },
+                    );
+                }
+                Ok(_) => Self::clear_local_meta(config),
+                Err(e) => {
+                    logging::warn(format!("could not record remote index metadata: {e}"));
+                    Self::clear_local_meta(config);
+                }
+            }
+        } else {
+            Self::clear_local_meta(config);
+        }
         Ok(())
     }
 
@@ -575,9 +987,18 @@ mod tests {
             ..AppConfig::default()
         };
         let root = config.key_root();
-        let mut index = BlobIndex::default();
-        index.version = CURRENT_INDEX_VERSION + 1;
-        index.save(&store, &root, &config).unwrap();
+        // Simulate a future binary layout without using the current writer,
+        // which always emits CURRENT_INDEX_VERSION.
+        let mut future = Vec::new();
+        future.extend_from_slice(b"QIDX");
+        future.extend_from_slice(&(CURRENT_INDEX_VERSION + 1).to_le_bytes());
+        future.extend_from_slice(&0i64.to_le_bytes());
+        store
+            .put(
+                &BlobIndex::remote_key(&root),
+                &crate::core::compression::lz4_compress_with_prefix(&future),
+            )
+            .unwrap();
 
         let err = BlobIndex::load(&store, &root, &config).unwrap_err();
         assert!(matches!(err, BackupError::Store(_)), "got {err:?}");
@@ -812,6 +1233,202 @@ mod tests {
         );
 
         std::fs::remove_file(BlobIndex::local_path(&config)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_save_does_not_overwrite_live_remote_index() {
+        let dir = std::env::temp_dir().join(format!("index-failed-save-{}", uuid::Uuid::new_v4()));
+        let store = crate::core::store::LocalStore::new(&dir).unwrap();
+        let config = AppConfig {
+            bucket: "bucket".into(),
+            prefix: "qia-backups".into(),
+            backup_set_uuid: uuid::Uuid::new_v4().to_string(),
+            ..AppConfig::default()
+        };
+        let root = config.key_root();
+
+        let mut good = BlobIndex::default();
+        good.add_blob(loc("good", false, "standardobjects/go/od/good"));
+        good.save(&store, &root, &config).unwrap();
+        let before = store.get(&BlobIndex::remote_key(&root)).unwrap();
+
+        let mut corrupt = BlobIndex::default();
+        corrupt.blobs.insert(
+            "wrong-key".into(),
+            loc("other-id", false, "standardobjects/ot/he/other-id"),
+        );
+        let err = corrupt.save(&store, &root, &config).unwrap_err();
+        assert!(
+            err.to_string().contains("mismatched identifier"),
+            "got {err:?}"
+        );
+
+        let after = store.get(&BlobIndex::remote_key(&root)).unwrap();
+        assert_eq!(
+            before, after,
+            "a failed migration must leave the live S3 base untouched"
+        );
+
+        std::fs::remove_file(BlobIndex::local_path(&config)).ok();
+        std::fs::remove_file(BlobIndex::local_meta_path(&config)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn binary_index_roundtrips_flags_offsets_and_legacy_ids() {
+        let mut index = BlobIndex::default();
+        index.add_pack("blobpacks/p1".into(), 100);
+        index.add_blob(BlobLoc {
+            blob_identifier: format!("{:064x}", 1),
+            is_packed: true,
+            relative_path: "blobpacks/p1".into(),
+            offset: 5,
+            length: 7,
+            stretch_encryption_key: true,
+            compression_type: 2,
+        });
+        index.add_blob(BlobLoc {
+            blob_identifier: "legacy-id".into(),
+            is_packed: false,
+            relative_path: "standardobjects/le/legacy-id".into(),
+            offset: 0,
+            length: 42,
+            stretch_encryption_key: false,
+            compression_type: 0,
+        });
+
+        let encoded = index.encode_binary().unwrap();
+        let decoded = BlobIndex::decode_binary(&encoded).unwrap();
+        assert_eq!(decoded.version, CURRENT_INDEX_VERSION);
+        assert_eq!(decoded.blobs.len(), 2);
+        assert_eq!(decoded.packs["blobpacks/p1"].size, 100);
+        let packed = decoded.blob(&format!("{:064x}", 1)).unwrap();
+        assert!(packed.is_packed);
+        assert_eq!(packed.offset, 5);
+        assert_eq!(packed.length, 7);
+        assert!(packed.stretch_encryption_key);
+        assert_eq!(packed.compression_type, 2);
+        let standalone = decoded.blob("legacy-id").unwrap();
+        assert!(!standalone.is_packed);
+        assert_eq!(standalone.relative_path, "standardobjects/le/legacy-id");
+        assert_eq!(standalone.length, 42);
+    }
+
+    #[test]
+    fn binary_index_is_far_smaller_than_json() {
+        let mut index = BlobIndex::default();
+        index.add_pack("blobpacks/p1.blobpack".into(), 1 << 20);
+        for i in 0..1000u64 {
+            index.add_blob(BlobLoc {
+                blob_identifier: format!("{i:064x}"),
+                is_packed: true,
+                relative_path: "blobpacks/p1.blobpack".into(),
+                offset: i * 1024,
+                length: 1024,
+                stretch_encryption_key: false,
+                compression_type: 2,
+            });
+        }
+        let json = serde_json::to_vec(&index).unwrap();
+        let binary = index.encode_binary().unwrap();
+        assert!(
+            binary.len() * 3 < json.len(),
+            "binary index ({} bytes) should be much smaller than JSON ({} bytes)",
+            binary.len(),
+            json.len()
+        );
+    }
+
+    struct CountingStore {
+        inner: crate::core::store::LocalStore,
+        etag: parking_lot::Mutex<String>,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BlobStore for CountingStore {
+        fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(key, data)
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>> {
+            self.inner.get(key)
+        }
+
+        fn get_opt(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_opt(key)
+        }
+
+        fn head(&self, key: &str) -> Result<Option<crate::core::store::ObjectInfo>> {
+            Ok(self.inner.head(key)?.map(|mut info| {
+                info.etag = Some(self.etag.lock().clone());
+                info
+            }))
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<crate::core::store::ObjectInfo>> {
+            self.inner.list(prefix)
+        }
+
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    #[test]
+    fn unchanged_remote_index_is_not_downloaded_again() {
+        let dir = std::env::temp_dir().join(format!("index-etag-test-{}", uuid::Uuid::new_v4()));
+        let inner = crate::core::store::LocalStore::new(&dir).unwrap();
+        let store = CountingStore {
+            inner,
+            etag: parking_lot::Mutex::new("etag-1".into()),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let config = AppConfig {
+            bucket: "bucket".into(),
+            prefix: "qia-backups".into(),
+            backup_set_uuid: uuid::Uuid::new_v4().to_string(),
+            ..AppConfig::default()
+        };
+        let root = config.key_root();
+
+        let mut index = BlobIndex::default();
+        index.add_blob(loc("a", false, "standardobjects/aa/a"));
+        index.save(&store, &root, &config).unwrap();
+
+        let loaded = BlobIndex::load(&store, &root, &config).unwrap();
+        assert!(loaded.blob("a").is_some());
+        assert_eq!(
+            store.gets.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a matching local cache must be used without GET"
+        );
+
+        *store.etag.lock() = "etag-2".into();
+        store.gets.store(0, std::sync::atomic::Ordering::SeqCst);
+        let loaded = BlobIndex::load(&store, &root, &config).unwrap();
+        assert!(loaded.blob("a").is_some());
+        assert_eq!(
+            store.gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a changed remote base must be downloaded"
+        );
+
+        store.gets.store(0, std::sync::atomic::Ordering::SeqCst);
+        BlobIndex::load(&store, &root, &config).unwrap();
+        assert_eq!(
+            store.gets.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refreshed cache must skip the next GET"
+        );
+
+        std::fs::remove_file(BlobIndex::local_path(&config)).ok();
+        std::fs::remove_file(BlobIndex::local_meta_path(&config)).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

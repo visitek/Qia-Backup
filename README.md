@@ -170,9 +170,9 @@ cargo build --release
 cargo install --path . --bin qia-backupctl
 ```
 
-`cargo test` runs 97 library tests plus 7 versioned format tests, including full
+`cargo test` runs 179 library tests plus 10 versioned format tests, including full
 backup/restore, encryption, incremental dedupe, symlinks, compression, partial
-browsing and retention.
+browsing, retention, v1-to-v2 index migration, and failed-save safety.
 
 ---
 
@@ -427,6 +427,38 @@ Keep these points in mind when versioning is enabled:
 safe; the app never changes versioning settings or permanently deletes object
 versions.
 
+### Format versioning and upgrades
+
+The persisted formats are versioned independently:
+
+- `CURRENT_INDEX_VERSION` for the blob index and journals
+- `BACKUP_FORMAT_VERSION` for backup records
+- `NODE_TREE_VERSION` for encoded file trees
+- `BLOB_IDENTIFIER_SHA256` and the compression constants for stored objects
+
+Rules for every format change:
+
+- New readers must keep loading older fixtures. `tests/backup_format_versions.rs`
+  is append-only: keep the existing version module and add a new one for each
+  format bump.
+- Writers always write the current version. An older or newer format must be
+  rejected rather than reinterpreted or overwritten.
+- A version bump must update the pinned constants test, add an old-to-new
+  migration test, and add a fixed fixture for the new byte layout.
+- Migration must be proven as `old load -> new save -> new reload`, with the
+  old remote object left untouched until the new object is durably written.
+
+Index v1 to v2:
+
+- Version-1 JSON indexes remain readable.
+- Loading a v1 index never rewrites S3 immediately. The next successful
+  compaction writes the v2 binary base and only then clears the journals.
+- A failed, cancelled, or interrupted run leaves the previous remote base in
+  place. The local cache is only a cache; it is validated with HEAD/ETag and is
+  never used as a substitute for a missing remote base.
+- An older app version rejects a v2 index instead of corrupting it. Upgrade all
+  clients that share a backup set before relying on the new format.
+
 ## How backups work
 
 1. **Prepare source** — create/mount an APFS snapshot, or validate the folder /
@@ -435,9 +467,12 @@ versions.
    decrypt it with the configured password.
 3. **Ensure metadata** — create `backupconfig.json`, `backupplan.json`,
    `backupfolders.json` and `backupfolder.json` if missing.
-4. **Load index** — download `blobindex.json.lz4`, replay any
-   `indexjournal/*` segments from an interrupted run, and merge with the local
-   cache at `~/Library/Application Support/Qia Backup/index/<uuid>.json`.
+4. **Load index** — check `blobindex.json.lz4` with a HEAD request and reuse the
+   local cache at `~/Library/Application Support/Qia Backup/index/<uuid>.json`
+   when its recorded ETag/size still match. Otherwise download the compact
+   binary index, replay any `indexjournal/*` segments from an interrupted run,
+   and merge with the local cache. The `.json.lz4` key name is kept for
+   compatibility, but new bases use the version-2 binary layout.
 5. **Load previous record** — read the latest record and its trees, reuse
    unchanged file nodes, and re-index referenced blobs.
 6. **Walk** — recursively compare `(inode, size, mtime, mode)`, chunk changed
