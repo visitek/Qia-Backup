@@ -574,6 +574,16 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     "**/.lmstudio/models",
     "**/.keras/models",
     "**/.docker/models",
+    // Container runtimes keep their VM disks in app-group data. Exclude only
+    // the known OrbStack VM volume folder: excluding all Group Containers
+    // would also drop real app data such as Notes or Office documents.
+    "**/Library/Group Containers/*.dev.orbstack/data",
+    "**/Library/Group Containers/*.dev.orbstack/data/**",
+    // Docker Desktop stores all images/containers in a VM disk here. The
+    // surrounding Container data still contains logs/settings, so exclude
+    // only the VM volume.
+    "**/Library/Containers/com.docker.docker/Data/vms",
+    "**/Library/Containers/com.docker.docker/Data/vms/**",
     "**/Library/Application Support/LM Studio/models",
     "**/Library/Application Support/Jan/data/models",
     "**/*.gguf",

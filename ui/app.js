@@ -25,6 +25,13 @@ const DEFAULT_EXCLUDE_PATTERNS = [
   "**/.lmstudio/models",
   "**/.keras/models",
   "**/.docker/models",
+  // OrbStack keeps its VM disk in an app-group container. Exclude only that
+  // data folder; other Group Containers contain real application data.
+  "**/Library/Group Containers/*.dev.orbstack/data",
+  "**/Library/Group Containers/*.dev.orbstack/data/**",
+  // Docker Desktop keeps images/containers in a VM disk under Data/vms.
+  "**/Library/Containers/com.docker.docker/Data/vms",
+  "**/Library/Containers/com.docker.docker/Data/vms/**",
   "**/Library/Application Support/LM Studio/models",
   "**/Library/Application Support/Jan/data/models",
   "**/*.gguf",

@@ -2914,6 +2914,33 @@ mod tests {
     }
 
     #[test]
+    fn container_vm_disks_are_excluded_but_other_app_data_is_kept() {
+        let set = build_excludes(&crate::core::model::default_exclude_patterns()).unwrap();
+        assert!(
+            set.is_match(
+                "Users/alice/Library/Group Containers/HUAQ24HBR6.dev.orbstack/data/data.img.raw"
+            ),
+            "OrbStack's VM disk should not be uploaded by default"
+        );
+        assert!(
+            set.is_match(
+                "Users/alice/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw"
+            ),
+            "Docker Desktop's VM disk should not be uploaded by default"
+        );
+        assert!(
+            !set.is_match(
+                "Users/alice/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+            ),
+            "other Group Containers contain real application data"
+        );
+        assert!(
+            !set.is_match("Users/alice/Library/Containers/com.example.app/Data/Documents/file.txt"),
+            "other app containers must still be backed up"
+        );
+    }
+
+    #[test]
     fn partial_tree_is_published_during_backup_and_cleared_on_success() {
         let src = std::env::temp_dir().join(format!("partial-src-{}", uuid::Uuid::new_v4()));
         let store_dir =

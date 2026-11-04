@@ -170,7 +170,7 @@ cargo build --release
 cargo install --path . --bin qia-backupctl
 ```
 
-`cargo test` runs 179 library tests plus 10 versioned format tests, including full
+`cargo test` runs 180 library tests plus 10 versioned format tests, including full
 backup/restore, encryption, incremental dedupe, symlinks, compression, partial
 browsing, retention, v1-to-v2 index migration, and failed-save safety.
 

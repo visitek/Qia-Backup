@@ -567,6 +567,16 @@ mod tests {
                 .iter()
                 .any(|p| p == "**/Library/Caches")
         );
+        assert!(
+            cfg.exclude_patterns
+                .iter()
+                .any(|p| p == "**/Library/Group Containers/*.dev.orbstack/data")
+        );
+        assert!(
+            cfg.exclude_patterns
+                .iter()
+                .any(|p| p == "**/Library/Containers/com.docker.docker/Data/vms")
+        );
         assert!(!cfg.exclude_patterns.iter().any(|p| p == "**/dev"));
         assert!(AppConfig::default().included_folders.is_empty());
         assert!(AppConfig::default().exclude_patterns.is_empty());
