@@ -626,6 +626,7 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     "**/.pytest_cache",
     "**/.mypy_cache",
     "**/.ruff_cache",
+    "**/.angular",
 ];
 
 /// macOS filesystem metadata that is never useful in a backup. These are

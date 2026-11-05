@@ -72,6 +72,7 @@ const DEFAULT_EXCLUDE_PATTERNS = [
   "**/.pytest_cache",
   "**/.mypy_cache",
   "**/.ruff_cache",
+  "**/.angular",
 ];
 
 const state = {
