@@ -23,7 +23,10 @@ use crate::core::store::BlobStore;
 /// Current on-disk index/journal schema. Bump this when the representation
 /// changes incompatibly and add a migration path; an older app must never
 /// reinterpret or overwrite a newer index.
-pub const CURRENT_INDEX_VERSION: u32 = 2;
+///
+/// Version 3 adds deletion tombstones to journals so edits and garbage
+/// collection can update the index without rewriting the full base object.
+pub const CURRENT_INDEX_VERSION: u32 = 3;
 
 /// Magic prefix for the compact binary base index. The version follows it as
 /// a little-endian u32 so a future layout can keep the same prefix.
@@ -60,6 +63,22 @@ pub struct IndexJournal {
     pub blobs: HashMap<String, BlobLoc>,
     #[serde(default)]
     pub packs: HashMap<String, PackInfo>,
+    /// Blob identifiers removed since the last journal segment. Version 3+.
+    #[serde(default)]
+    pub removed_blobs: Vec<String>,
+    /// Pack paths removed since the last journal segment. Version 3+.
+    #[serde(default)]
+    pub removed_packs: Vec<String>,
+}
+
+/// Result of pruning an index: the object paths that can now be deleted, plus
+/// the exact index entries that were removed so they can be recorded in a
+/// journal instead of rewriting the whole base index.
+#[derive(Debug, Clone, Default)]
+pub struct PruneDelta {
+    pub removed_objects: Vec<String>,
+    pub removed_blob_ids: Vec<String>,
+    pub removed_pack_paths: Vec<String>,
 }
 
 /// Small sidecar next to the local index cache. It records which remote base
@@ -494,6 +513,20 @@ impl BlobIndex {
     fn merge_journal(&mut self, journal: IndexJournal) {
         self.merge_blobs(journal.blobs);
         self.merge_packs(journal.packs);
+        // Deletions are applied after additions so a tombstone in the same
+        // segment always wins. Journals are replayed oldest-first.
+        for id in journal.removed_blobs {
+            self.blobs.remove(&id);
+        }
+        if !journal.removed_packs.is_empty() {
+            let removed: HashSet<&str> = journal.removed_packs.iter().map(String::as_str).collect();
+            self.packs
+                .retain(|path, _| !removed.contains(path.as_str()));
+            // Defensive: never leave blobs pointing at a pack that a journal
+            // explicitly removed.
+            self.blobs
+                .retain(|_, loc| !removed.contains(loc.relative_path.as_str()));
+        }
         if journal.updated_at > self.updated_at {
             self.updated_at = journal.updated_at;
         }
@@ -589,12 +622,12 @@ impl BlobIndex {
         index.journal_segments = 0;
         let prefix = Self::journal_prefix(root);
         let journals = store.list(&prefix)?;
+        let mut decoded = Vec::with_capacity(journals.len());
         for object in journals {
             match store.get_opt(&object.key) {
                 Ok(Some(bytes)) => match Self::decode_journal(&bytes) {
                     Some(journal) if journal.version <= CURRENT_INDEX_VERSION => {
-                        index.merge_journal(journal);
-                        index.journal_segments += 1;
+                        decoded.push((object.key, journal));
                     }
                     Some(journal) => {
                         return Err(BackupError::Store(format!(
@@ -617,6 +650,17 @@ impl BlobIndex {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        // Tombstones make replay order significant, so apply journals by
+        // their recorded time rather than by object-name ordering.
+        decoded.sort_by(|a, b| {
+            a.1.updated_at
+                .cmp(&b.1.updated_at)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (_, journal) in decoded {
+            index.merge_journal(journal);
+            index.journal_segments += 1;
         }
         if ignored_local_without_base {
             if index.journal_segments > 0 {
@@ -665,13 +709,12 @@ impl BlobIndex {
     pub fn replay_journals_lenient(&mut self, store: &dyn BlobStore, root: &str) -> Result<usize> {
         let prefix = Self::journal_prefix(root);
         let journals = store.list(&prefix)?;
-        let mut merged = 0;
+        let mut decoded = Vec::with_capacity(journals.len());
         for object in journals {
             match store.get_opt(&object.key)? {
                 Some(bytes) => match Self::decode_journal(&bytes) {
                     Some(journal) if journal.version <= CURRENT_INDEX_VERSION => {
-                        self.merge_journal(journal);
-                        merged += 1;
+                        decoded.push((object.key, journal));
                     }
                     Some(journal) => {
                         return Err(BackupError::Store(format!(
@@ -690,6 +733,15 @@ impl BlobIndex {
                 )),
             }
         }
+        decoded.sort_by(|a, b| {
+            a.1.updated_at
+                .cmp(&b.1.updated_at)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let merged = decoded.len();
+        for (_, journal) in decoded {
+            self.merge_journal(journal);
+        }
         Ok(merged)
     }
 
@@ -707,6 +759,37 @@ impl BlobIndex {
             updated_at: Utc::now(),
             blobs: blobs.clone(),
             packs: packs.clone(),
+            removed_blobs: Vec::new(),
+            removed_packs: Vec::new(),
+        };
+        let json = serde_json::to_vec(&journal)?;
+        let compressed = crate::core::compression::lz4_compress_with_prefix(&json);
+        store.put(&Self::journal_key(root), &compressed)?;
+        Ok(())
+    }
+
+    /// Upload a small journal that removes blobs and packs from the index.
+    ///
+    /// This is used after explicit edits and garbage collection so the index
+    /// can be made consistent without re-uploading the full (potentially
+    /// hundreds of megabytes) base object. The base is compacted on the next
+    /// normal backup checkpoint.
+    pub fn save_deletions(
+        store: &dyn BlobStore,
+        root: &str,
+        removed_blobs: &[String],
+        removed_packs: &[String],
+    ) -> Result<()> {
+        if removed_blobs.is_empty() && removed_packs.is_empty() {
+            return Ok(());
+        }
+        let journal = IndexJournal {
+            version: CURRENT_INDEX_VERSION,
+            updated_at: Utc::now(),
+            blobs: HashMap::new(),
+            packs: HashMap::new(),
+            removed_blobs: removed_blobs.to_vec(),
+            removed_packs: removed_packs.to_vec(),
         };
         let json = serde_json::to_vec(&journal)?;
         let compressed = crate::core::compression::lz4_compress_with_prefix(&json);
@@ -817,6 +900,13 @@ impl BlobIndex {
     /// still referenced. Bytes of unreferenced blobs inside a surviving pack
     /// stay in the pack object; only the index entry is dropped.
     pub fn prune_to(&mut self, keep: &HashSet<String>) -> Vec<String> {
+        self.prune_to_delta(keep).removed_objects
+    }
+
+    /// Like [`Self::prune_to`], but also reports the exact blob identifiers
+    /// and pack paths that were dropped so they can be recorded in a small
+    /// deletion journal instead of rewriting the full base index.
+    pub fn prune_to_delta(&mut self, keep: &HashSet<String>) -> PruneDelta {
         let mut removed_objects = Vec::new();
         let mut remove_ids = Vec::new();
         let mut pack_kept: HashMap<String, u64> = HashMap::new();
@@ -835,23 +925,33 @@ impl BlobIndex {
             }
         }
 
-        for id in remove_ids {
-            self.blobs.remove(&id);
+        for id in &remove_ids {
+            self.blobs.remove(id);
         }
         // A pack is unreachable when no surviving blob points into it. This
         // also drops orphan pack records that have no indexed members.
         let pack_paths: Vec<String> = self.packs.keys().cloned().collect();
+        let mut removed_pack_paths = Vec::new();
         for path in pack_paths {
             if pack_kept.get(&path).copied().unwrap_or(0) == 0 {
                 self.packs.remove(&path);
-                removed_objects.push(path);
+                removed_objects.push(path.clone());
+                removed_pack_paths.push(path);
             }
         }
 
         self.updated_at = Utc::now();
         removed_objects.sort();
         removed_objects.dedup();
-        removed_objects
+        remove_ids.sort();
+        remove_ids.dedup();
+        removed_pack_paths.sort();
+        removed_pack_paths.dedup();
+        PruneDelta {
+            removed_objects,
+            removed_blob_ids: remove_ids,
+            removed_pack_paths,
+        }
     }
 
     pub fn resolve_object_key(root: &str, relative_path: &str) -> String {
@@ -967,6 +1067,60 @@ mod tests {
     }
 
     #[test]
+    fn prune_delta_reports_blob_and_pack_tombstones() {
+        let mut idx = BlobIndex::default();
+        idx.add_blob(loc("a", true, "blobpacks/p1"));
+        idx.add_blob(loc("b", true, "blobpacks/p2"));
+        idx.add_pack("blobpacks/p1".into(), 10);
+        idx.add_pack("blobpacks/p2".into(), 20);
+        idx.add_blob(loc("c", false, "standardobjects/c"));
+        let keep: HashSet<String> = ["a".into()].into_iter().collect();
+        let delta = idx.prune_to_delta(&keep);
+        assert_eq!(delta.removed_blob_ids, vec!["b", "c"]);
+        assert_eq!(delta.removed_pack_paths, vec!["blobpacks/p2"]);
+        assert!(
+            delta
+                .removed_objects
+                .contains(&"standardobjects/c".to_string())
+        );
+        assert!(delta.removed_objects.contains(&"blobpacks/p2".to_string()));
+    }
+
+    #[test]
+    fn deletion_journal_removes_blobs_and_packs_on_load() {
+        let dir = std::env::temp_dir().join(format!("index-tombstone-{}", uuid::Uuid::new_v4()));
+        let store = crate::core::store::LocalStore::new(&dir).unwrap();
+        let config = AppConfig {
+            bucket: "bucket".into(),
+            prefix: "qia-backups".into(),
+            backup_set_uuid: uuid::Uuid::new_v4().to_string(),
+            ..AppConfig::default()
+        };
+        let root = config.key_root();
+        let mut index = BlobIndex::default();
+        index.add_blob(loc("a", false, "standardobjects/a"));
+        index.add_blob(loc("b", true, "blobpacks/p1"));
+        index.add_pack("blobpacks/p1".into(), 10);
+        index.save(&store, &root, &config).unwrap();
+
+        BlobIndex::save_deletions(
+            &store,
+            &root,
+            &["b".to_string()],
+            &["blobpacks/p1".to_string()],
+        )
+        .unwrap();
+
+        let loaded = BlobIndex::load(&store, &root, &config).unwrap();
+        assert!(loaded.blob("a").is_some());
+        assert!(loaded.blob("b").is_none());
+        assert!(!loaded.packs.contains_key("blobpacks/p1"));
+
+        std::fs::remove_file(BlobIndex::local_path(&config)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn pack_records_carry_no_duplicated_blob_ids() {
         let mut idx = BlobIndex::default();
         idx.add_blob(loc("a", true, "blobpacks/p1"));
@@ -1024,6 +1178,8 @@ mod tests {
             updated_at: Utc::now(),
             blobs: HashMap::new(),
             packs: HashMap::new(),
+            removed_blobs: Vec::new(),
+            removed_packs: Vec::new(),
         };
         let json = serde_json::to_vec(&journal).unwrap();
         let compressed = crate::core::compression::lz4_compress_with_prefix(&json);

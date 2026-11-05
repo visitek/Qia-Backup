@@ -187,7 +187,7 @@ pub fn prune_unreferenced(
     }
 
     let mut index = BlobIndex::load(store, &root, config)?;
-    let removed = index.prune_to(&referenced);
+    let delta = index.prune_to_delta(&referenced);
     let mut summary = PruneSummary {
         records_before: keys.len(),
         records_kept: keys.len(),
@@ -196,13 +196,22 @@ pub fn prune_unreferenced(
         blobs_referenced: referenced.len(),
         ..PruneSummary::default()
     };
-    if removed.is_empty() {
+    if delta.removed_objects.is_empty() {
         return Ok(summary);
     }
 
-    index.updated_at = Utc::now();
-    index.save_and_clear(store, &root, config)?;
-    for relative in &removed {
+    // Record the tombstones in a small journal instead of re-uploading the
+    // full base index after every removal. The base is compacted on the next
+    // normal backup checkpoint. Persist before deleting so a crash can only
+    // leave unreferenced objects behind, never a dedupe entry pointing at a
+    // missing object.
+    BlobIndex::save_deletions(
+        store,
+        &root,
+        &delta.removed_blob_ids,
+        &delta.removed_pack_paths,
+    )?;
+    for relative in &delta.removed_objects {
         cancel.check()?;
         let key = record::root_key(&root, relative);
         logging::info(format!("deleting unreferenced object {key}"));

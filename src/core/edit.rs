@@ -5,6 +5,8 @@
 //! are deliberately independent: removing from an old revision must not
 //! silently change what a future backup scans.
 
+use std::collections::HashMap;
+
 use globset::escape;
 
 use crate::core::error::{BackupError, Result};
@@ -108,6 +110,19 @@ pub struct RemoveSummary {
     pub index_saved: bool,
 }
 
+/// Result of removing several entries from one completed record in a single
+/// pass.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveEntriesSummary {
+    pub record_key: String,
+    pub removed_paths: Vec<String>,
+    pub removed_files: u64,
+    /// False when the record was updated but the new tree blobs could not be
+    /// persisted in the index. The record remains valid and recoverable.
+    pub index_saved: bool,
+}
+
 /// Result of removing every ignored entry from a completed record.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,6 +142,9 @@ struct TreeWriter<'a> {
     root: String,
     index: BlobIndex,
     encryptor: Option<ObjectEncryptor>,
+    /// Tree blobs added by this edit. They are persisted as one journal
+    /// segment so editing a revision never rewrites the full base index.
+    added_blobs: HashMap<String, BlobLoc>,
 }
 
 impl TreeWriter<'_> {
@@ -160,7 +178,16 @@ impl TreeWriter<'_> {
             compression_type: compressed.compression_type,
         };
         self.index.add_blob(loc.clone());
+        self.added_blobs.insert(id, loc.clone());
         Ok(loc)
+    }
+
+    /// Persist the tree blobs added by this edit as a journal segment.
+    fn save_index(&mut self, store: &dyn BlobStore, root: &str) -> Result<()> {
+        if self.added_blobs.is_empty() {
+            return Ok(());
+        }
+        BlobIndex::save_journal(store, root, &self.added_blobs, &HashMap::new())
     }
 }
 
@@ -176,12 +203,33 @@ pub fn remove_entry(
     path: &str,
     cancel: &CancelToken,
 ) -> Result<RemoveSummary> {
+    let summary = remove_entries(config, store, record_key, &[path.to_string()], cancel)?;
+    Ok(RemoveSummary {
+        record_key: summary.record_key,
+        path: summary.removed_paths.into_iter().next().unwrap_or_default(),
+        removed_files: summary.removed_files,
+        index_saved: summary.index_saved,
+    })
+}
+
+/// Remove several files or folders from one completed backup record in a
+/// single pass.
+///
+/// The record is loaded once and written once, the tree blobs added by the
+/// edit are journaled once, and duplicate or nested paths are collapsed before
+/// anything is touched. This is the batch counterpart of [`remove_entry`] and
+/// keeps multi-selection cheap.
+pub fn remove_entries(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    record_key: Option<&str>,
+    paths: &[String],
+    cancel: &CancelToken,
+) -> Result<RemoveEntriesSummary> {
     cancel.check()?;
-    let root = config.key_root();
-    let normalized = restore::normalize_backup_path(path)?;
-    if normalized.is_empty() {
+    if paths.is_empty() {
         return Err(BackupError::Other(
-            "cannot remove the backup root; choose a file or folder".into(),
+            "choose at least one file or folder to remove".into(),
         ));
     }
     if record_key == Some("partial") {
@@ -190,10 +238,38 @@ pub fn remove_entry(
         ));
     }
 
+    let mut normalized_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let normalized = restore::normalize_backup_path(path)?;
+        if normalized.is_empty() {
+            return Err(BackupError::Other(
+                "cannot remove the backup root; choose a file or folder".into(),
+            ));
+        }
+        normalized_paths.push(normalized);
+    }
+    normalized_paths.sort();
+    normalized_paths.dedup();
+    // A queued parent already covers every queued descendant, so collapse
+    // them instead of rewriting the same subtree twice.
+    let mut selected: Vec<String> = Vec::with_capacity(normalized_paths.len());
+    for path in normalized_paths {
+        let covered = selected.iter().any(|parent| {
+            path == *parent
+                || path
+                    .strip_prefix(parent.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        if !covered {
+            selected.push(path);
+        }
+    }
+
+    let root = config.key_root();
     let record_key = restore::resolve_record_key(config, store, record_key)?;
     let keys = restore::load_keys(config, store, &root)?;
     let mut record = record::load_record(store, &record_key, keys.as_ref())?;
-    let root_node = record.root_node()?;
+    let mut root_node = record.root_node()?;
     if !root_node.is_tree {
         return Err(BackupError::Codec(
             "backup record root is not a directory".into(),
@@ -216,40 +292,49 @@ pub fn remove_entry(
         root: root.clone(),
         index,
         encryptor: keys.clone().map(ObjectEncryptor::new),
+        added_blobs: HashMap::new(),
     };
-    let components = restore::path_components(&normalized)?;
-    let (new_root, removed_files) = remove_child(
-        store,
-        &root,
-        keys.as_ref(),
-        &mut writer,
-        &root_node,
-        &components,
-        &normalized,
-    )?;
+    let mut removed_files = 0u64;
+    for path in &selected {
+        cancel.check()?;
+        let components = restore::path_components(path)?;
+        let (new_root, removed) = remove_child(
+            store,
+            &root,
+            keys.as_ref(),
+            &mut writer,
+            &root_node,
+            &components,
+            path,
+        )?;
+        root_node = new_root;
+        removed_files = removed_files.saturating_add(removed);
+    }
 
     record.node = base64::engine::general_purpose::STANDARD
-        .encode(codec::encode_node(&new_root, record.node_tree_version));
+        .encode(codec::encode_node(&root_node, record.node_tree_version));
     record.files_count = record.files_count.saturating_sub(removed_files);
 
     let bytes = record::encode_record(&record, writer.encryptor.as_mut())?;
     store.put(&record_key, &bytes)?;
 
-    let index_saved = match writer.index.save_and_clear(store, &root, config) {
+    let index_saved = match writer.save_index(store, &root) {
         Ok(()) => true,
         Err(e) => {
             logging::warn(format!(
-                "removed {normalized:?} from {record_key}, but saving the blob index failed: {e}"
+                "removed {} path(s) from {record_key}, but saving the blob index failed: {e}",
+                selected.len()
             ));
             false
         }
     };
     logging::info(format!(
-        "removed {normalized:?} from record {record_key} ({removed_files} files)"
+        "removed {} path(s) from record {record_key} ({removed_files} files)",
+        selected.len()
     ));
-    Ok(RemoveSummary {
+    Ok(RemoveEntriesSummary {
         record_key,
-        path: normalized,
+        removed_paths: selected,
         removed_files,
         index_saved,
     })
@@ -368,6 +453,7 @@ pub fn remove_ignored_entries(
         root: root.clone(),
         index,
         encryptor: keys.clone().map(ObjectEncryptor::new),
+        added_blobs: HashMap::new(),
     };
     let (new_root, removed_files, removed_entries) = remove_ignored_from_node(
         store,
@@ -396,7 +482,7 @@ pub fn remove_ignored_entries(
     let bytes = record::encode_record(&record, writer.encryptor.as_mut())?;
     store.put(&record_key, &bytes)?;
 
-    let index_saved = match writer.index.save_and_clear(store, &root, config) {
+    let index_saved = match writer.save_index(store, &root) {
         Ok(()) => true,
         Err(e) => {
             logging::warn(format!(
@@ -622,6 +708,82 @@ mod remove_tests {
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&dst).ok();
         std::fs::remove_dir_all(&restore_dir).ok();
+    }
+
+    #[test]
+    fn removes_multiple_entries_in_one_pass_and_collapses_nested_paths() {
+        let src = temp_path("edit-batch-src");
+        let dst = temp_path("edit-batch-store");
+        std::fs::create_dir_all(src.join("drop/inside")).unwrap();
+        std::fs::create_dir_all(src.join("keep")).unwrap();
+        std::fs::write(src.join("one.txt"), b"one").unwrap();
+        std::fs::write(src.join("two.txt"), b"two").unwrap();
+        std::fs::write(src.join("drop/a.txt"), b"a").unwrap();
+        std::fs::write(src.join("drop/inside/b.txt"), b"b").unwrap();
+        std::fs::write(src.join("keep/c.txt"), b"c").unwrap();
+
+        let store = LocalStore::new(&dst).unwrap();
+        let mut config = test_config(&src);
+        backup(&mut config, &store);
+        let key = latest(&config, &store);
+
+        let summary = remove_entries(
+            &config,
+            &store,
+            Some(&key),
+            &[
+                "two.txt".to_string(),
+                "drop".to_string(),
+                "drop/inside".to_string(),
+                "two.txt".to_string(),
+            ],
+            &CancelToken::new(),
+        )
+        .unwrap();
+        // Nested paths under `drop` and the duplicate `two.txt` collapse.
+        assert_eq!(summary.removed_paths, vec!["drop", "two.txt"]);
+        assert_eq!(summary.removed_files, 3);
+        assert!(summary.index_saved);
+
+        let names = list(&config, &store, &key, "");
+        assert_eq!(names, vec!["keep", "one.txt"]);
+        assert_eq!(list(&config, &store, &key, "keep"), vec!["c.txt"]);
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn removal_journals_index_changes_without_rewriting_the_base() {
+        let src = temp_path("edit-journal-src");
+        let dst = temp_path("edit-journal-store");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("b.txt"), b"b").unwrap();
+
+        let store = LocalStore::new(&dst).unwrap();
+        let mut config = test_config(&src);
+        backup(&mut config, &store);
+        let key = latest(&config, &store);
+        let root = config.key_root();
+        assert!(
+            store
+                .list(&BlobIndex::journal_prefix(&root))
+                .unwrap()
+                .is_empty(),
+            "a completed backup compacts the index"
+        );
+
+        remove_entry(&config, &store, Some(&key), "a.txt", &CancelToken::new()).unwrap();
+
+        let journals = store.list(&BlobIndex::journal_prefix(&root)).unwrap();
+        assert_eq!(journals.len(), 1, "the edit must be journaled");
+        // The base plus the new journal must still reconstruct a healthy index.
+        BlobIndex::load(&store, &root, &config).unwrap();
+        assert!(!list(&config, &store, &key, "").contains(&"a.txt".to_string()));
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
     }
 
     #[test]

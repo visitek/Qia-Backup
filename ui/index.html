@@ -242,8 +242,8 @@
         <div class="toolbar card files-toolbar">
           <div class="files-toolbar-copy">
             <h3>Backed-up files</h3>
-            <p class="muted">Browse a revision, restore a file or folder, ignore it in future backups, or remove it from this revision.</p>
-            <p class="muted small" id="files-note">Current means the latest completed backup. During a run, select Partial current backup and click Refresh to update the list. Ignore affects future backups only; Remove edits only the selected completed revision.</p>
+            <p class="muted">Browse a revision, restore a file or folder, ignore it in future backups, or add it to the To remove list for this revision.</p>
+            <p class="muted small" id="files-note">Current means the latest completed backup. During a run, select Partial current backup and click Refresh to update the list. Ignore affects future backups only; Remove queues items and edits only the selected completed revision.</p>
             <p class="muted small version-status hidden" id="files-version-status"></p>
           </div>
           <div class="files-toolbar-controls">
@@ -270,6 +270,20 @@
                   <span>Ignored only</span>
                 </label>
               </div>
+            </div>
+            <div class="remove-stack hidden" id="remove-stack">
+              <div class="remove-stack-head">
+                <div class="remove-stack-title">
+                  <strong>To remove</strong>
+                  <span class="muted small" id="remove-stack-count"></span>
+                </div>
+                <div class="remove-stack-actions">
+                  <button class="button subtle" id="remove-stack-clear" type="button">Clear</button>
+                  <button class="button danger" id="remove-stack-run" type="button">Remove from revision</button>
+                </div>
+              </div>
+              <ul class="remove-stack-list" id="remove-stack-list"></ul>
+              <p class="muted small remove-stack-note" id="remove-stack-note">Queued entries are removed together in one operation. Review the list, then remove it from this revision.</p>
             </div>
             <div class="table-wrap files-table-wrap">
               <table class="table" id="files-table">

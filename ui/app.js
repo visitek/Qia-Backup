@@ -103,6 +103,8 @@ const state = {
   filesActionBusy: false,
   filesError: "",
   filesNotice: "",
+  removeQueue: [],
+  removeQueueRecordKey: "",
   versionCounts: {},
   versionCountsLoading: false,
   versionCountsPath: "",
@@ -1069,7 +1071,7 @@ function updateFilesNote() {
   } else if (state.status?.partialAvailable) {
     note.textContent = "A partial backup from the last stopped run is available. It has no completed record yet; restore works for content already uploaded. Ignore affects future backups; Remove needs a completed record.";
   } else {
-    note.textContent = "Current backup means the latest completed backup record. Ignore excludes a path from future backups; Remove edits only the selected completed revision. Partial uploads from an interrupted run are kept for resume until a completed record exists.";
+    note.textContent = "Current backup means the latest completed backup record. Ignore excludes a path from future backups; Remove queues items and edits only the selected completed revision when you apply the list. Partial uploads from an interrupted run are kept for resume until a completed record exists.";
   }
 }
 
@@ -1166,6 +1168,18 @@ function renderFiles() {
   const partial = state.filesRecordKey === "partial";
   const actionBusy = !!state.filesActionBusy;
   const restoreBlocked = !!state.status?.running || !!state.status?.restoring || !!state.status?.editing || actionBusy;
+  renderRemoveStack();
+  if ($("remove-stack-run")) {
+    $("remove-stack-run").disabled = partial || restoreBlocked || !state.removeQueue.length;
+    $("remove-stack-run").title = partial
+      ? "Partial backups have no completed record to edit"
+      : restoreBlocked
+        ? "Stop the active backup or restore before removing files"
+        : !state.removeQueue.length
+          ? "Add files or folders to the To remove list first"
+          : "Remove every queued item in one operation";
+  }
+  if ($("remove-stack-clear")) $("remove-stack-clear").disabled = actionBusy;
   $("files-restore-all").disabled = restoreBlocked;
   $("files-restore-all").title = actionBusy || state.status?.editing
     ? "Wait for the current file action to finish"
@@ -1236,6 +1250,7 @@ function renderFiles() {
   body.innerHTML = entries.map((entry) => {
     const kind = entry.isDir ? "Folder" : entry.isSymlink ? "Symlink" : "File";
     const icon = entry.isDir ? "▸" : entry.isSymlink ? "↗" : "·";
+    const queuedForRemoval = state.removeQueue.some((queued) => removePathCovers(queued, entry.path));
     const ignoredBadge = entry.ignored
       ? '<span class="ignored-badge" title="This path matches a current ignore rule">Ignored</span>'
       : "";
@@ -1280,10 +1295,16 @@ function renderFiles() {
       : actionBusy
         ? "Wait for the current file action to finish"
         : "Stop the active backup or restore before removing files";
-    const remove = removeBlocked
-      ? `<button class="link-button" type="button" disabled title="${removeTitle}">Remove</button>`
-      : `<button class="link-button" type="button" data-files-remove="${esc(entry.path)}">Remove</button>`;
-    return `<tr${entry.ignored ? ' class="files-ignored-row"' : ""}>
+    const remove = queuedForRemoval
+      ? '<button class="link-button" type="button" disabled title="Already in the To remove list">Queued</button>'
+      : (removeBlocked
+          ? `<button class="link-button" type="button" disabled title="${removeTitle}">Remove</button>`
+          : `<button class="link-button" type="button" data-files-remove="${esc(entry.path)}" title="Add to the To remove list">Remove</button>`);
+    const rowClasses = [
+      entry.ignored ? "files-ignored-row" : "",
+      queuedForRemoval ? "files-queued-row" : "",
+    ].filter(Boolean);
+    return `<tr${rowClasses.length ? ` class="${rowClasses.join(" ")}"` : ""}>
       <td><div class="files-name"><span class="files-icon${entry.isDir ? "" : " file"}">${icon}</span>${name}${ignoredBadge}</div></td>
       <td>${kind}</td>
       <td>${size}</td>
@@ -1296,6 +1317,7 @@ function renderFiles() {
 
 async function refreshFiles() {
   if (demo || !invoke || !state.config?.bucket) {
+    clearRemoveQueue({ render: false });
     state.filesEntries = [];
     state.filesListingIgnored = false;
     state.filesLoading = false;
@@ -1338,6 +1360,7 @@ async function refreshFiles() {
         state.filesEntries = result.entries || [];
         state.filesListingIgnored = !!result.ignored;
         state.filesResolvedRecord = "partial";
+        clearRemoveQueue({ render: false });
         state.filesPath = result.path || state.filesPath;
         if (!state.filesEntries.length) {
           state.filesNotice = "No files completed in this folder yet. Click Refresh to see newer files.";
@@ -1364,6 +1387,7 @@ async function refreshFiles() {
     }
   }
   if (!state.backups.length) {
+    clearRemoveQueue({ render: false });
     state.filesLoading = false;
     state.filesError = "";
     state.filesNotice = state.status?.running
@@ -1383,6 +1407,10 @@ async function refreshFiles() {
     state.filesEntries = result.entries || [];
     state.filesListingIgnored = !!result.ignored;
     state.filesResolvedRecord = result.recordKey || "";
+    if (state.removeQueue.length && state.removeQueueRecordKey && state.filesResolvedRecord
+        && state.removeQueueRecordKey !== state.filesResolvedRecord) {
+      clearRemoveQueue({ render: false });
+    }
     state.filesPath = result.path || state.filesPath;
   } catch (e) {
     if (requestId !== state.filesRequest) return;
@@ -1438,20 +1466,102 @@ async function ignoreFilesEntry(path) {
   }
 }
 
-async function removeFilesEntry(path) {
+function normalizeRemovePath(path) {
+  return String(path || "").replace(/^\/+|\/+$/g, "");
+}
+
+function removePathCovers(parent, child) {
+  return child === parent || child.startsWith(`${parent}/`);
+}
+
+function clearRemoveQueue({ render = true } = {}) {
+  const hadItems = state.removeQueue.length > 0;
+  state.removeQueue = [];
+  state.removeQueueRecordKey = "";
+  if (render && hadItems) {
+    renderRemoveStack();
+    renderFiles();
+  }
+}
+
+function renderRemoveStack() {
+  const panel = $("remove-stack");
+  if (!panel) return;
+  const queue = state.removeQueue || [];
+  panel.classList.toggle("hidden", queue.length === 0);
+  if (!queue.length) {
+    $("remove-stack-list").innerHTML = "";
+    return;
+  }
+  $("remove-stack-count").textContent = `${queue.length} ${queue.length === 1 ? "entry" : "entries"}`;
+  $("remove-stack-list").innerHTML = queue.map((path) => `
+    <li class="remove-stack-item">
+      <span class="remove-stack-path" title="${esc(path)}">${esc(path)}</span>
+      <button class="link-button remove-stack-drop" type="button" data-remove-stack-drop="${esc(path)}" title="Remove this item from the To remove list">Remove</button>
+    </li>`).join("");
+  $("remove-stack-run").textContent = `Remove ${queue.length} from this revision`;
+}
+
+function enqueueRemovePath(path) {
   if (demo || !invoke) return toast("Preview mode — file actions are not available.", true);
-  if (!path) return;
   if (state.filesRecordKey === "partial") {
     return toast("Partial backups have no completed record to edit.", true);
   }
   if (state.status?.running || state.status?.restoring || state.status?.editing || state.filesActionBusy) {
     return toast("Stop the active backup or restore before removing files.", true);
   }
+  const normalized = normalizeRemovePath(path);
+  if (!normalized) return toast("Cannot queue the backup root for removal.", true);
+
+  const recordKey = state.removeQueueRecordKey
+    || state.filesResolvedRecord
+    || state.filesRecordKey
+    || "";
+  if (state.removeQueue.length && state.removeQueueRecordKey && recordKey && state.removeQueueRecordKey !== recordKey) {
+    clearRemoveQueue({ render: false });
+  }
+
+  if (state.removeQueue.some((queued) => removePathCovers(queued, normalized))) {
+    return toast(`${normalized} is already in the To remove list.`);
+  }
+  // A queued parent covers all descendants, so replace them with the parent.
+  state.removeQueue = state.removeQueue.filter((queued) => !removePathCovers(normalized, queued));
+  state.removeQueue.push(normalized);
+  state.removeQueueRecordKey = recordKey;
+  renderRemoveStack();
+  renderFiles();
+  toast(`Added ${normalized} to the To remove list.`);
+}
+
+function dequeueRemovePath(path) {
+  const normalized = normalizeRemovePath(path);
+  state.removeQueue = state.removeQueue.filter((queued) => queued !== normalized);
+  if (!state.removeQueue.length) state.removeQueueRecordKey = "";
+  renderRemoveStack();
+  renderFiles();
+}
+
+async function executeRemoveQueue() {
+  if (demo || !invoke) return toast("Preview mode — file actions are not available.", true);
+  const queue = state.removeQueue.slice();
+  if (!queue.length) return;
+  if (state.filesRecordKey === "partial") {
+    return toast("Partial backups have no completed record to edit.", true);
+  }
+  if (state.status?.running || state.status?.restoring || state.status?.editing || state.filesActionBusy) {
+    return toast("Stop the active backup or restore before removing files.", true);
+  }
+  const recordKey = state.removeQueueRecordKey
+    || state.filesResolvedRecord
+    || state.filesRecordKey
+    || "";
+  const listed = queue.slice(0, 5).map((path) => `• ${path}`).join("\n");
+  const more = queue.length > 5 ? `\n…and ${queue.length - 5} more` : "";
   const ok = await confirmAction({
-    title: "Remove from this revision?",
-    message: `Remove "${path}" from this backup revision?`,
-    detail: "This cannot be undone. Other backup revisions keep their copy. Use Ignore to skip it in future backups.",
-    confirmLabel: "Remove",
+    title: "Remove queued entries?",
+    message: `Remove ${queue.length} ${queue.length === 1 ? "entry" : "entries"} from this backup revision as one operation?`,
+    detail: `${listed}${more}\n\nThis cannot be undone. Other backup revisions keep their copies.`,
+    confirmLabel: queue.length === 1 ? "Remove entry" : `Remove ${queue.length} entries`,
     danger: true,
   });
   if (!ok) return;
@@ -1460,17 +1570,19 @@ async function removeFilesEntry(path) {
   state.filesActionBusy = true;
   renderFiles();
   try {
-    await invoke("remove_backup_entry", {
-      recordKey: state.filesRecordKey || null,
-      path,
+    const summary = await invoke("remove_backup_entries", {
+      recordKey: recordKey || null,
+      paths: queue,
     });
-    const parent = filesParentPath(path);
-    if (state.filesPath === path || state.filesPath.startsWith(`${path}/`)) {
-      state.filesPath = parent;
+    const removedAncestor = queue.find((path) => removePathCovers(path, state.filesPath));
+    if (removedAncestor) {
+      state.filesPath = filesParentPath(removedAncestor);
       state.filesFilter = "";
       if ($("files-filter")) $("files-filter").value = "";
     }
-    toast(`Removed ${path} from this backup revision.`);
+    const removed = Number(summary?.removedPaths?.length || queue.length);
+    toast(`Removed ${removed} ${removed === 1 ? "entry" : "entries"} from this backup revision.`);
+    clearRemoveQueue({ render: false });
     await refreshFiles();
   } catch (e) {
     toast(String(e), true);
@@ -2077,9 +2189,12 @@ async function poll() {
       $("files-cancel").classList.remove("hidden");
       $("files-restore-all").disabled = true;
     } else if (state.status.editing) {
+      const cleaning = String(state.status.phase || "").toLowerCase() === "cleaning";
       $("files-progress").classList.remove("hidden");
       $("files-phase").textContent = state.status.detail || "Updating the backup…";
-      $("files-stats").textContent = "Removing the entry and cleaning up unreferenced data…";
+      $("files-stats").textContent = cleaning
+        ? "Checking other backup revisions and reclaiming unreferenced data…"
+        : "Removing the entry from the selected backup revision…";
       $("files-cancel").classList.add("hidden");
       $("files-restore-all").disabled = true;
     } else {
@@ -2379,6 +2494,7 @@ function bind() {
     state.filesPath = "";
     state.filesFilter = "";
     state.filesIgnoredOnly = false;
+    clearRemoveQueue({ render: false });
     $("files-filter").value = "";
     if ($("files-ignored-only")) $("files-ignored-only").checked = false;
     refreshFiles();
@@ -2434,7 +2550,13 @@ function bind() {
       return;
     }
     const remove = event.target.closest("[data-files-remove]");
-    if (remove) removeFilesEntry(remove.getAttribute("data-files-remove"));
+    if (remove) enqueueRemovePath(remove.getAttribute("data-files-remove"));
+  });
+  $("remove-stack-run").addEventListener("click", executeRemoveQueue);
+  $("remove-stack-clear").addEventListener("click", () => clearRemoveQueue());
+  $("remove-stack-list").addEventListener("click", (event) => {
+    const drop = event.target.closest("[data-remove-stack-drop]");
+    if (drop) dequeueRemovePath(drop.getAttribute("data-remove-stack-drop"));
   });
   $("files-cancel").addEventListener("click", async () => {
     const restoring = !!state.status?.restoring;

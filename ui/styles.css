@@ -218,8 +218,9 @@ body::before {
 /* Progress */
 .progress-card { margin-top: 16px; }
 .progress-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
-.progress-phase { font-weight: 600; font-size: 13px; text-transform: capitalize; }
-.progress-detail { color: var(--text-faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-phase { font-weight: 600; font-size: 13px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+#progress-phase { text-transform: capitalize; }
+.progress-detail { color: var(--text-faint); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .progress-track { height: 6px; border-radius: 999px; background: rgba(148, 176, 210, 0.12); overflow: hidden; }
 .progress-bar { height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
 .progress-bar.indeterminate { width: 38%; animation: slide 1.4s ease-in-out infinite; }
@@ -444,6 +445,28 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 }
 
 .files-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+
+/* Remove stack */
+.remove-stack {
+  margin-bottom: 12px; padding: 12px; border-radius: 10px;
+  background: rgba(255, 107, 122, .06); border: 1px solid rgba(255, 107, 122, .22);
+}
+.remove-stack-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.remove-stack-title { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.remove-stack-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.remove-stack-list {
+  list-style: none; margin: 10px 0 0; padding: 0; max-height: 180px; overflow: auto;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.remove-stack-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0;
+  padding: 5px 8px; border-radius: 8px; background: rgba(255, 255, 255, .03);
+  font-family: var(--mono); font-size: 11.5px;
+}
+.remove-stack-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remove-stack-drop { flex: none; color: var(--text-dim); }
+.remove-stack-note { margin: 8px 0 0; }
+.files-queued-row { background: rgba(255, 107, 122, .05); }
 
 /* Version history and side-by-side file diff */
 .versions-cell { white-space: nowrap; }

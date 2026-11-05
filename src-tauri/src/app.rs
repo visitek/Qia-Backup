@@ -453,8 +453,8 @@ async fn remove_backup_entry(
             return Err("stop the active backup or restore before removing files".into());
         }
         status.editing = true;
-        status.phase = "editing".into();
-        status.detail = format!("Removing {path} from backup…");
+        status.phase = "removing".into();
+        status.detail = format!("Removing {} from backup…", short_object_name(&path));
         status.last_error = None;
     }
     let cfg = state.config.lock().clone();
@@ -481,6 +481,17 @@ async fn remove_backup_entry(
                 }
             };
         if summary.index_saved {
+            {
+                // The entry is already gone from the record; the remaining
+                // work is a full garbage-collection pass, which can take a
+                // while on large backup sets.
+                let mut status = status_arc.lock();
+                status.phase = "cleaning".into();
+                status.detail = format!(
+                    "Removed {}; cleaning up unreferenced data…",
+                    short_object_name(&summary.path)
+                );
+            }
             match retention::prune_unreferenced(&cfg, store.as_ref(), &cancel) {
                 Ok(gc) => logging::info(format!(
                     "removed {} from backup; reclaimed {} objects",
@@ -489,6 +500,100 @@ async fn remove_backup_entry(
                 Err(e) => logging::warn(format!(
                     "removed {} from backup, but garbage collection failed: {e}",
                     summary.path
+                )),
+            }
+        }
+        {
+            let mut status = status_arc.lock();
+            status.editing = false;
+            status.phase = "idle".into();
+            status.detail.clear();
+            status.last_finished_at = Some(chrono::Utc::now());
+        }
+        Ok(summary)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Remove several queued files or folders from one completed record in a
+/// single pass: one record write, one index journal, one garbage-collection
+/// run. This is the batch counterpart of `remove_backup_entry`.
+#[tauri::command]
+async fn remove_backup_entries(
+    state: State<'_, SharedState>,
+    record_key: Option<String>,
+    paths: Vec<String>,
+) -> Result<edit::RemoveEntriesSummary, String> {
+    consume_sensitive_grant(state.inner(), "remove")?;
+    if paths.is_empty() {
+        return Err("choose at least one file or folder to remove".into());
+    }
+    let count = paths.len();
+    {
+        let mut status = state.status.lock();
+        if status.running || status.restoring || status.editing {
+            return Err("stop the active backup or restore before removing files".into());
+        }
+        status.editing = true;
+        status.phase = "removing".into();
+        status.detail = format!(
+            "Removing {count} {} from backup…",
+            if count == 1 { "entry" } else { "entries" }
+        );
+        status.last_error = None;
+    }
+    let cfg = state.config.lock().clone();
+    if let Err(e) = config::validate(&cfg) {
+        state.status.lock().fail(err(&e));
+        return Err(err(e));
+    }
+    let status_arc = state.status.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = match new_store(&cfg) {
+            Ok(store) => store,
+            Err(e) => {
+                status_arc.lock().fail(err(&e));
+                return Err(err(e));
+            }
+        };
+        let cancel = CancelToken::new();
+        let summary = match edit::remove_entries(
+            &cfg,
+            store.as_ref(),
+            record_key.as_deref(),
+            &paths,
+            &cancel,
+        ) {
+            Ok(summary) => summary,
+            Err(e) => {
+                status_arc.lock().fail(err(&e));
+                return Err(err(e));
+            }
+        };
+        if summary.index_saved {
+            {
+                let noun = if summary.removed_paths.len() == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                };
+                let mut status = status_arc.lock();
+                status.phase = "cleaning".into();
+                status.detail = format!(
+                    "Removed {} {noun}; cleaning up unreferenced data…",
+                    summary.removed_paths.len()
+                );
+            }
+            match retention::prune_unreferenced(&cfg, store.as_ref(), &cancel) {
+                Ok(gc) => logging::info(format!(
+                    "removed {} path(s) from backup; reclaimed {} objects",
+                    summary.removed_paths.len(),
+                    gc.objects_deleted
+                )),
+                Err(e) => logging::warn(format!(
+                    "removed {} path(s) from backup, but garbage collection failed: {e}",
+                    summary.removed_paths.len()
                 )),
             }
         }
@@ -520,7 +625,7 @@ async fn remove_ignored_entries(
             return Err("stop the active backup or restore before removing files".into());
         }
         status.editing = true;
-        status.phase = "editing".into();
+        status.phase = "removing".into();
         status.detail = "Removing ignored paths from backup…".into();
         status.last_error = None;
     }
@@ -552,6 +657,19 @@ async fn remove_ignored_entries(
             }
         };
         if summary.index_saved && summary.removed_entries > 0 {
+            {
+                let noun = if summary.removed_entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                };
+                let mut status = status_arc.lock();
+                status.phase = "cleaning".into();
+                status.detail = format!(
+                    "Removed {} ignored {noun}; cleaning up unreferenced data…",
+                    summary.removed_entries
+                );
+            }
             match retention::prune_unreferenced(&cfg, store.as_ref(), &cancel) {
                 Ok(gc) => logging::info(format!(
                     "removed {} ignored entries from backup; reclaimed {} objects",
@@ -1797,6 +1915,7 @@ pub fn run() {
             pick_restore_destination,
             ignore_backup_entry,
             remove_backup_entry,
+            remove_backup_entries,
             remove_ignored_entries,
             storage_estimate,
             diff_backup,
